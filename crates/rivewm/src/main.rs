@@ -19,7 +19,8 @@ fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    rivewm_platform::enable_dpi_awareness().context("failed to enable per-monitor DPI awareness")?;
+    rivewm_platform::enable_dpi_awareness()
+        .context("failed to enable per-monitor DPI awareness")?;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -48,7 +49,10 @@ fn list(all: bool) -> Result<()> {
     }
 
     let windows = rivewm_platform::enumerate_windows();
-    let shown: Vec<_> = windows.iter().filter(|w| all || w.is_manageable()).collect();
+    let shown: Vec<_> = windows
+        .iter()
+        .filter(|w| all || w.is_manageable())
+        .collect();
     println!(
         "\nWindows ({} tileable, {} total):",
         windows.iter().filter(|w| w.is_manageable()).count(),
@@ -90,7 +94,10 @@ fn events(all: bool) -> Result<()> {
         .map(|w| w.id)
         .collect();
 
-    println!("Listening for window events ({} tileable windows). Ctrl+C to stop.", known.len());
+    println!(
+        "Listening for window events ({} tileable windows). Ctrl+C to stop.",
+        known.len()
+    );
     for event in rx {
         let id = event.window();
         let info = rivewm_platform::query_window(id);

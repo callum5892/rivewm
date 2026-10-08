@@ -43,6 +43,10 @@ There is exactly **one** representation, the split tree. Dynamic layouts are
 Each workspace carries its own `Layout`, so switching layouts is per workspace
 and switching back to `Manual` keeps whatever tree the dynamic layout produced.
 
+Directional focus is *geometric*: it picks the nearest window on screen in
+that direction from the arranged rects, not by walking the tree. That keeps
+it correct for any tree shape a layout produces.
+
 Because everything stays a tree, focus-direction, swap, resize and the
 tree → rect function work the same in every layout. The constraint that keeps
 this possible: **commands must never assume the user built the tree by hand.**

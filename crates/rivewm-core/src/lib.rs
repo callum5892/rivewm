@@ -5,9 +5,13 @@
 
 pub mod event;
 pub mod geometry;
+pub mod layout;
+pub mod tree;
 
 pub use event::WindowEvent;
 pub use geometry::Rect;
+pub use layout::Layout;
+pub use tree::{Axis, Direction, Gaps, NodeId, Tree};
 
 /// Opaque identifier for a native window.
 ///

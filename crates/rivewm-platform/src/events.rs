@@ -7,8 +7,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CHILDID_SELF, DispatchMessageW, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY,
-    EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW,
+    CHILDID_SELF, DispatchMessageW, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
+    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW,
     EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
     EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GetMessageW,
     MSG, OBJID_WINDOW, PostThreadMessageW, TranslateMessage, WINEVENT_OUTOFCONTEXT,
@@ -50,7 +50,10 @@ impl EventThread {
         let thread_id = ready_rx
             .recv()
             .expect("event thread exited before reporting")?;
-        let thread = Self { thread_id, join: Some(join) };
+        let thread = Self {
+            thread_id,
+            join: Some(join),
+        };
         Ok((thread, event_rx))
     }
 
@@ -75,10 +78,7 @@ impl Drop for EventThread {
     }
 }
 
-fn run(
-    event_tx: Sender<WindowEvent>,
-    ready_tx: mpsc::SyncSender<windows::core::Result<u32>>,
-) {
+fn run(event_tx: Sender<WindowEvent>, ready_tx: mpsc::SyncSender<windows::core::Result<u32>>) {
     SENDER.with(|s| *s.borrow_mut() = Some(event_tx));
 
     let mut hooks = Vec::new();
