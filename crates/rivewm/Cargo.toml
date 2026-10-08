@@ -7,8 +7,11 @@ edition.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 ctrlc = "3.5.2"
+regex = "1.13.1"
 rivewm-core.workspace = true
 rivewm-platform.workspace = true
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.7"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

@@ -9,8 +9,11 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
-use rivewm_core::{Command, Gaps, Layout, NodeId, Tree, WindowEvent, WindowId};
+use rivewm_core::{Command, Layout, NodeId, Tree, WindowEvent, WindowId};
+use rivewm_platform::WindowInfo;
 use tracing::{debug, info, warn};
+
+use crate::config::{Config, RuleAction};
 
 /// Every window we currently manage, kept outside `Wm` so the Ctrl+C handler
 /// and panic hook can still restore them when `Wm` is unreachable.
@@ -21,23 +24,30 @@ static CLOAKED: Mutex<BTreeSet<WindowId>> = Mutex::new(BTreeSet::new());
 
 pub struct Wm {
     tree: Tree,
-    gaps: Gaps,
+    config: Config,
 }
 
 impl Wm {
     /// Creates one workspace per attached monitor, named "1", "2", ...
-    pub fn new(gaps: Gaps) -> Self {
+    pub fn new(config: Config) -> Self {
         let mut tree = Tree::new();
         for (i, m) in rivewm_platform::monitors().into_iter().enumerate() {
             let monitor = tree.add_monitor(m.id, m.work_area);
             tree.add_workspace(monitor, (i + 1).to_string(), Layout::Manual);
             info!(device = %m.device, work_area = %m.work_area, "added monitor");
         }
-        Self { tree, gaps }
+        Self { tree, config }
     }
 
-    /// Tiles every window that's already open, keeping their left-to-right
-    /// order on each monitor.
+    /// Swaps in a reloaded config. New gaps apply immediately; rules apply
+    /// to windows opened from now on.
+    pub fn set_config(&mut self, config: Config) {
+        self.config = config;
+        self.apply_all();
+    }
+
+    /// Manages every window that's already open, keeping tiled windows on
+    /// their monitor in their left-to-right order.
     pub fn manage_existing(&mut self) {
         let mut windows: Vec<_> = rivewm_platform::enumerate_windows()
             .into_iter()
@@ -46,15 +56,7 @@ impl Wm {
         windows.sort_by_key(|w| (w.frame.x, w.frame.y));
 
         for w in windows {
-            let Some(ws) = self
-                .tree
-                .monitor_by_id(w.monitor)
-                .and_then(|m| self.tree.active_workspace(m))
-                .or(self.tree.focused_workspace())
-            else {
-                continue;
-            };
-            self.insert(ws, &w);
+            self.manage(&w, true);
         }
         if let Some(fg) = rivewm_platform::foreground_window() {
             self.tree.focus_window(fg);
@@ -80,13 +82,13 @@ impl Wm {
                     self.apply_all();
                 }
             }
-            Command::Workspace(n) => {
-                let ws = self.workspace_named(&n.to_string());
+            Command::Workspace(name) => {
+                let ws = self.workspace_named(&name);
                 self.show_workspace(ws);
             }
-            Command::MoveToWorkspace(n) => {
+            Command::MoveToWorkspace(name) => {
                 if let Some(id) = focused {
-                    let ws = self.workspace_named(&n.to_string());
+                    let ws = self.workspace_named(&name);
                     self.send_to_workspace(id, ws);
                 }
             }
@@ -120,6 +122,8 @@ impl Wm {
                 }
             }
             Command::Retile => self.apply_all(),
+            // Handled by the main loop, which owns the hotkey registrations.
+            Command::ReloadConfig => {}
             Command::Quit => return ControlFlow::Break(()),
         }
         ControlFlow::Continue(())
@@ -319,27 +323,46 @@ impl Wm {
         if !info.is_manageable() || info.minimized {
             return;
         }
-        // Tiled windows open on the focused workspace. Floating ones stay
-        // where the app put them, on whichever workspace that monitor shows.
-        let ws = if info.floating {
-            self.tree
-                .monitor_by_id(info.monitor)
-                .and_then(|m| self.tree.active_workspace(m))
-                .or(self.tree.focused_workspace())
-        } else {
-            self.tree.focused_workspace()
-        };
-        let Some(ws) = ws else {
-            return;
-        };
-        self.insert(ws, &info);
-        if !info.floating {
+        if let Some(ws) = self.manage(&info, false)
+            && self.tree.is_workspace_active(ws)
+            && !self.tree.is_floating(id)
+        {
             self.apply(ws);
         }
     }
 
-    fn insert(&mut self, ws: NodeId, info: &rivewm_platform::WindowInfo) {
-        if info.floating {
+    /// Starts managing a window, following the first matching window rule.
+    ///
+    /// Without a rule saying otherwise, a new tiled window opens on the
+    /// focused workspace, while at startup it stays on the monitor it's
+    /// already on. Floating windows always stay where the app put them, on
+    /// whichever workspace that monitor shows. Returns the workspace, or
+    /// `None` if a rule says to ignore the window.
+    fn manage(&mut self, info: &WindowInfo, at_startup: bool) -> Option<NodeId> {
+        let rule = self.config.rule_for(info);
+        let action = rule.and_then(|r| r.action);
+        let target = rule.and_then(|r| r.workspace.clone());
+        if action == Some(RuleAction::Ignore) {
+            debug!(window = format_args!("{:#x}", info.id.0), "ignored by rule");
+            return None;
+        }
+        let floating = match action {
+            Some(RuleAction::Float) => true,
+            Some(RuleAction::Tile) => false,
+            _ => info.floating,
+        };
+
+        let on_its_monitor = self
+            .tree
+            .monitor_by_id(info.monitor)
+            .and_then(|m| self.tree.active_workspace(m));
+        let ws = match target {
+            Some(name) => self.workspace_named(&name),
+            None if floating || at_startup => on_its_monitor.or(self.tree.focused_workspace())?,
+            None => self.tree.focused_workspace()?,
+        };
+
+        if floating {
             self.tree.insert_floating(ws, info.id, info.frame);
         } else {
             self.tree.insert_window(ws, info.id);
@@ -348,9 +371,15 @@ impl Wm {
         info!(
             window = format_args!("{:#x}", info.id.0),
             title = info.title,
-            floating = info.floating,
+            floating,
+            workspace = self.tree.workspace_name(ws),
             "managing"
         );
+        if !self.tree.is_workspace_active(ws) {
+            // A rule sent it to a workspace that isn't shown.
+            cloak(info.id, true);
+        }
+        Some(ws)
     }
 
     fn unmanage(&mut self, id: WindowId) {
@@ -382,7 +411,7 @@ impl Wm {
     }
 
     fn apply(&self, ws: NodeId) {
-        for (id, rect) in self.tree.arrange(ws, self.gaps) {
+        for (id, rect) in self.tree.arrange(ws, self.config.gaps) {
             if let Err(err) = rivewm_platform::set_frame(id, rect) {
                 // Typically an elevated window we aren't allowed to move.
                 warn!(window = format_args!("{:#x}", id.0), %err, "failed to position window");

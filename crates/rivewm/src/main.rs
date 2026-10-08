@@ -1,10 +1,12 @@
-mod bindings;
+mod config;
 mod wm;
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rivewm_core::{Gaps, WindowEvent, WindowId};
+use config::Config;
+use rivewm_core::{Command, WindowEvent, WindowId};
 use rivewm_platform::{Event, Hotkey};
 use tracing_subscriber::EnvFilter;
 use wm::Wm;
@@ -13,7 +15,9 @@ const USAGE: &str = "\
 rivewm - a tiling window manager for Windows
 
 USAGE:
-    rivewm                   Run the window manager (Ctrl+C to quit)
+    rivewm [--config <path>] Run the window manager (Ctrl+C to quit). The
+                             config defaults to ~\\.config\\rivewm\\config.toml
+                             and is created on first run.
     rivewm --list [--all]    List monitors and the windows rivewm manages
                              (--all also shows skipped windows and why)
     rivewm --events [--all]  Log window events live until Ctrl+C
@@ -28,7 +32,17 @@ fn main() -> Result<()> {
     rivewm_platform::enable_dpi_awareness()
         .context("failed to enable per-monitor DPI awareness")?;
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let config_path = match args.iter().position(|a| a == "--config") {
+        Some(i) => {
+            args.remove(i);
+            if i >= args.len() {
+                bail!("--config needs a path\n\n{USAGE}");
+            }
+            PathBuf::from(args.remove(i))
+        }
+        None => config::default_path(),
+    };
     match args.first().map(String::as_str) {
         Some("--list") => list(args.iter().any(|a| a == "--all")),
         Some("--events") => events(args.iter().any(|a| a == "--all")),
@@ -36,25 +50,20 @@ fn main() -> Result<()> {
             print!("{USAGE}");
             Ok(())
         }
-        None => run(),
+        None => run(&config_path),
         Some(other) => bail!("unknown argument `{other}`\n\n{USAGE}"),
     }
 }
 
-fn run() -> Result<()> {
-    let mut hotkeys = Vec::new();
-    let mut commands = Vec::new();
-    for (key, command) in bindings::defaults() {
-        hotkeys.push(key.parse::<Hotkey>()?);
-        commands.push(command);
-    }
+fn run(config_path: &Path) -> Result<()> {
+    let config = config::load(config_path)?;
+    tracing::info!(path = %config_path.display(), "loaded config");
+    let (hotkeys, mut commands) = split_bindings(&config);
 
     // Hooks first, so no window that opens during startup is missed.
     let (events, rx) =
         rivewm_platform::EventThread::spawn(hotkeys).context("failed to install hooks")?;
-    for (hotkey, err) in events.failed_hotkeys() {
-        tracing::warn!(%hotkey, %err, "couldn't register hotkey; is another app using it?");
-    }
+    warn_failed_hotkeys(events.failed_hotkeys());
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -69,23 +78,47 @@ fn run() -> Result<()> {
     .context("failed to install Ctrl+C handler")?;
 
     wm::recover_cloaked();
-    let mut wm = Wm::new(Gaps { inner: 8, outer: 8 });
+    let mut wm = Wm::new(config);
     wm.manage_existing();
     tracing::info!("rivewm running. Alt+Shift+E or Ctrl+C to quit.");
 
     for event in rx {
         match event {
             Event::Window(event) => wm.handle(event),
-            Event::Hotkey(i) => {
-                if wm.execute(commands[i]).is_break() {
-                    break;
+            Event::Hotkey(i) => match commands.get(i).cloned() {
+                Some(Command::ReloadConfig) => match config::load(config_path) {
+                    Ok(config) => {
+                        let hotkeys;
+                        (hotkeys, commands) = split_bindings(&config);
+                        warn_failed_hotkeys(&events.set_hotkeys(hotkeys));
+                        wm.set_config(config);
+                        tracing::info!("reloaded config");
+                    }
+                    Err(err) => tracing::error!("{err:#}; keeping the current config"),
+                },
+                Some(command) => {
+                    if wm.execute(command).is_break() {
+                        break;
+                    }
                 }
-            }
+                None => {}
+            },
         }
     }
     tracing::info!("shutting down");
     wm::restore_all();
     Ok(())
+}
+
+/// Hotkeys to register, and the commands they trigger at the same indices.
+fn split_bindings(config: &Config) -> (Vec<Hotkey>, Vec<Command>) {
+    config.bindings.iter().cloned().unzip()
+}
+
+fn warn_failed_hotkeys(failed: &[(Hotkey, rivewm_platform::Error)]) {
+    for (hotkey, err) in failed {
+        tracing::warn!(%hotkey, %err, "couldn't register hotkey; is another app using it?");
+    }
 }
 
 fn list(all: bool) -> Result<()> {

@@ -1,0 +1,104 @@
+# rivewm configuration
+#
+# Reload with Alt+Shift+C after editing. Delete this file to get the defaults
+# back on the next start. Any section you leave out uses its default.
+
+[gaps]
+# Space between tiled windows, in pixels.
+inner = 8
+# Space between windows and the edge of the screen (not counting the taskbar).
+outer = 8
+
+# Hotkey = command.
+#
+# Modifiers: alt, ctrl, shift, win
+# Keys:      a-z, 0-9, f1-f24, left, right, up, down, enter, space, tab,
+#            escape, backspace, delete, minus, equal, comma, period, semicolon
+#
+# Commands:
+#   focus <left|right|up|down>      move <left|right|up|down>
+#   workspace <name>                move-to-workspace <name>
+#   split <horizontal|vertical>     toggle-split
+#   toggle-floating                 resize <width|height> <+N|-N>  (percent)
+#   retile                          reload-config
+#   quit
+#
+# A hotkey another app has already claimed is skipped with a warning.
+# This section replaces the defaults as a whole, so keep every binding you
+# want here.
+[keybindings]
+"alt+h" = "focus left"
+"alt+j" = "focus down"
+"alt+k" = "focus up"
+"alt+l" = "focus right"
+"alt+left" = "focus left"
+"alt+down" = "focus down"
+"alt+up" = "focus up"
+"alt+right" = "focus right"
+
+"alt+shift+h" = "move left"
+"alt+shift+j" = "move down"
+"alt+shift+k" = "move up"
+"alt+shift+l" = "move right"
+"alt+shift+left" = "move left"
+"alt+shift+down" = "move down"
+"alt+shift+up" = "move up"
+"alt+shift+right" = "move right"
+
+"alt+v" = "toggle-split"
+"alt+shift+space" = "toggle-floating"
+
+"alt+ctrl+l" = "resize width +5"
+"alt+ctrl+h" = "resize width -5"
+"alt+ctrl+j" = "resize height +5"
+"alt+ctrl+k" = "resize height -5"
+"alt+ctrl+right" = "resize width +5"
+"alt+ctrl+left" = "resize width -5"
+"alt+ctrl+down" = "resize height +5"
+"alt+ctrl+up" = "resize height -5"
+
+"alt+1" = "workspace 1"
+"alt+2" = "workspace 2"
+"alt+3" = "workspace 3"
+"alt+4" = "workspace 4"
+"alt+5" = "workspace 5"
+"alt+6" = "workspace 6"
+"alt+7" = "workspace 7"
+"alt+8" = "workspace 8"
+"alt+9" = "workspace 9"
+"alt+shift+1" = "move-to-workspace 1"
+"alt+shift+2" = "move-to-workspace 2"
+"alt+shift+3" = "move-to-workspace 3"
+"alt+shift+4" = "move-to-workspace 4"
+"alt+shift+5" = "move-to-workspace 5"
+"alt+shift+6" = "move-to-workspace 6"
+"alt+shift+7" = "move-to-workspace 7"
+"alt+shift+8" = "move-to-workspace 8"
+"alt+shift+9" = "move-to-workspace 9"
+
+"alt+shift+r" = "retile"
+"alt+shift+c" = "reload-config"
+"alt+shift+e" = "quit"
+
+# Window rules decide how new windows are handled. The first matching rule
+# wins, and rules apply when a window opens (not to windows already open when
+# you reload).
+#
+# Match on any combination of:
+#   process = "Spotify.exe"     executable name, any case
+#   class   = "CabinetWClass"   window class, exact (see `rivewm --list --all`)
+#   title   = "regex"           regular expression on the window title
+#
+# Then apply either or both of:
+#   action    = "float" | "tile" | "ignore"
+#   workspace = "3"
+#
+# Examples:
+#
+# [[rules]]
+# process = "Spotify.exe"
+# workspace = "9"
+#
+# [[rules]]
+# title = "^Picture-in-picture$"
+# action = "float"

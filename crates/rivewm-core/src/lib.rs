@@ -9,7 +9,7 @@ pub mod geometry;
 pub mod layout;
 pub mod tree;
 
-pub use command::Command;
+pub use command::{Command, ParseCommandError};
 pub use event::WindowEvent;
 pub use geometry::Rect;
 pub use layout::Layout;

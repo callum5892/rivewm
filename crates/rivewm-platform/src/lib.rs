@@ -14,7 +14,7 @@ mod process;
 mod window;
 
 pub use cloak::set_cloaked;
-pub use events::{Event, EventThread};
+pub use events::{Event, EventThread, FailedHotkeys};
 pub use hotkey::{Hotkey, ParseHotkeyError};
 pub use monitor::{MonitorInfo, monitors};
 pub use window::{

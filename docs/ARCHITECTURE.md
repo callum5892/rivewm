@@ -8,6 +8,12 @@
 | `rivewm-platform` | Safe wrappers over the `windows` crate: enumerate, hooks, move, keys. |
 | `rivewm`          | Binary. Event loop wiring core ↔ platform, config, CLI.               |
 
+The config (`~\.config\rivewm\config.toml`) is parsed in `rivewm/src/config.rs`.
+Its defaults are `rivewm/src/default_config.toml`, compiled in and written out
+on first run, so there's exactly one place defaults live. Command strings
+(`focus left`, `workspace 3`, ...) parse in core (`Command::from_str`) so a
+future CLI/IPC can reuse them.
+
 ## Runtime model
 
 - One thread owns all WM state. Win32 hook callbacks and the hotkey hook only
