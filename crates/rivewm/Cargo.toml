@@ -1,0 +1,15 @@
+[package]
+name = "rivewm"
+description = "A tiling window manager for Windows"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+rivewm-core.workspace = true
+rivewm-platform.workspace = true
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[lints]
+workspace = true
