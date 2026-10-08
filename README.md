@@ -197,6 +197,10 @@ around are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   rather than anything breaking.
 - The focus border is Windows 11's 1-pixel window border.
 
+## AI use
+
+AI was used in parts of this project, but it has been fully reviewed by a human.
+
 ## License
 
 [MIT](LICENSE)
