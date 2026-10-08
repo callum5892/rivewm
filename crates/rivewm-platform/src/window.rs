@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetWindow, GetWindowLongPtrW,
-    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
     WINDOW_EX_STYLE, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
@@ -94,7 +94,15 @@ unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     true.into()
 }
 
-pub(crate) fn window_info(hwnd: HWND) -> WindowInfo {
+/// Looks up a single window. Returns `None` if it no longer exists.
+pub fn query_window(id: WindowId) -> Option<WindowInfo> {
+    let hwnd = HWND(id.0 as *mut c_void);
+    unsafe { IsWindow(Some(hwnd)) }
+        .as_bool()
+        .then(|| window_info(hwnd))
+}
+
+fn window_info(hwnd: HWND) -> WindowInfo {
     let mut pid = 0;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     let window_rect = window_rect(hwnd).unwrap_or_default();

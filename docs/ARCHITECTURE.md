@@ -58,3 +58,10 @@ ad-hoc tree edits in command handlers.
 - **Minimized windows** report `-32000,-32000`; their real size comes from
   `GetWindowPlacement`.
 - **Elevated windows** can't be moved unless rivewm is elevated (UIPI).
+- **Hidden fires before Destroyed** when an app closes, and is also what we'd
+  see when *we* hide a window to switch workspace. Either track our own
+  pending hides and ignore their events, or hide workspaces by cloaking
+  instead. Decide before implementing workspaces.
+- **Our own moves echo back** as `LocationChanged`. Ignore location events
+  between `MoveSizeStarted`/`MoveSizeEnded` pairs, and for windows we just
+  positioned.

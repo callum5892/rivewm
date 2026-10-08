@@ -3,8 +3,10 @@
 //! Nothing in this crate talks to Win32. The window tree, layout maths and
 //! command handling live here so they can be unit tested on any platform.
 
+pub mod event;
 pub mod geometry;
 
+pub use event::WindowEvent;
 pub use geometry::Rect;
 
 /// Opaque identifier for a native window.
