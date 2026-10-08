@@ -2,12 +2,16 @@ mod config;
 mod wm;
 
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, SyncSender};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use config::Config;
 use rivewm_core::{Command, WindowEvent, WindowId};
-use rivewm_platform::{Event, Hotkey};
+use rivewm_platform::{Event, EventThread, Hotkey};
+use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 use wm::Wm;
 
@@ -18,6 +22,11 @@ USAGE:
     rivewm [--config <path>] Run the window manager (Ctrl+C to quit). The
                              config defaults to ~\\.config\\rivewm\\config.toml
                              and is created on first run.
+    rivewm msg <request>     Send a request to the running rivewm and print
+                             its JSON reply. A request is any config command
+                             (e.g. `workspace 3`, `focus-window 0x1a2b`) or
+                             `query state` for monitors, workspaces, layout
+                             and windows.
     rivewm --list [--all]    List monitors and the windows rivewm manages
                              (--all also shows skipped windows and why)
     rivewm --events [--all]  Log window events live until Ctrl+C
@@ -44,6 +53,7 @@ fn main() -> Result<()> {
         None => config::default_path(),
     };
     match args.first().map(String::as_str) {
+        Some("msg") => msg(&args[1..]),
         Some("--list") => list(args.iter().any(|a| a == "--all")),
         Some("--events") => events(args.iter().any(|a| a == "--all")),
         Some("--help" | "-h") => {
@@ -55,14 +65,44 @@ fn main() -> Result<()> {
     }
 }
 
+/// Everything the main loop reacts to.
+enum Msg {
+    Event(Event),
+    /// An IPC request line, and where to send the response line.
+    Request(String, SyncSender<String>),
+}
+
 fn run(config_path: &Path) -> Result<()> {
     let config = config::load(config_path)?;
     tracing::info!(path = %config_path.display(), "loaded config");
-    let (hotkeys, mut commands) = split_bindings(&config);
+    let (hotkeys, commands) = split_bindings(&config);
+    let (tx, rx) = mpsc::channel::<Msg>();
 
-    // Hooks first, so no window that opens during startup is missed.
-    let (events, rx) =
-        rivewm_platform::EventThread::spawn(hotkeys).context("failed to install hooks")?;
+    // The IPC pipe goes first: it doubles as the check that no other rivewm
+    // is running, before we touch any windows.
+    let ipc_tx = tx.clone();
+    rivewm_platform::ipc::serve(move |line| {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        if ipc_tx
+            .send(Msg::Request(line.to_owned(), reply_tx))
+            .is_err()
+        {
+            return error_json("rivewm is shutting down");
+        }
+        reply_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| error_json("rivewm didn't respond in time"))
+    })?;
+    tracing::info!(
+        pipe = rivewm_platform::ipc::pipe_name(),
+        "listening for IPC"
+    );
+
+    // Hooks next, so no window that opens during startup is missed.
+    let events = rivewm_platform::EventThread::spawn(hotkeys, move |event| {
+        let _ = tx.send(Msg::Event(event));
+    })
+    .context("failed to install hooks")?;
     warn_failed_hotkeys(events.failed_hotkeys());
 
     let default_hook = std::panic::take_hook();
@@ -82,31 +122,106 @@ fn run(config_path: &Path) -> Result<()> {
     wm.manage_existing();
     tracing::info!("rivewm running. Alt+Shift+E or Ctrl+C to quit.");
 
-    for event in rx {
-        match event {
-            Event::Window(event) => wm.handle(event),
-            Event::Hotkey(i) => match commands.get(i).cloned() {
-                Some(Command::ReloadConfig) => match config::load(config_path) {
-                    Ok(config) => {
-                        let hotkeys;
-                        (hotkeys, commands) = split_bindings(&config);
-                        warn_failed_hotkeys(&events.set_hotkeys(hotkeys));
-                        wm.set_config(config);
-                        tracing::info!("reloaded config");
-                    }
-                    Err(err) => tracing::error!("{err:#}; keeping the current config"),
-                },
-                Some(command) => {
-                    if wm.execute(command).is_break() {
-                        break;
-                    }
-                }
-                None => {}
+    let mut app = App {
+        wm,
+        events,
+        commands,
+        config_path,
+    };
+    for msg in rx {
+        let flow = match msg {
+            Msg::Event(Event::Window(event)) => {
+                app.wm.handle(event);
+                ControlFlow::Continue(())
+            }
+            Msg::Event(Event::Hotkey(i)) => match app.commands.get(i).cloned() {
+                Some(command) => app.run_command(command).unwrap_or_else(|err| {
+                    tracing::error!("{err:#}");
+                    ControlFlow::Continue(())
+                }),
+                None => ControlFlow::Continue(()),
             },
+            Msg::Request(line, reply) => {
+                let (response, flow) = app.answer(&line);
+                let _ = reply.send(response.to_string());
+                flow
+            }
+        };
+        if flow.is_break() {
+            break;
         }
     }
     tracing::info!("shutting down");
     wm::restore_all();
+    Ok(())
+}
+
+/// The running WM plus what's needed to reload its config.
+struct App<'a> {
+    wm: Wm,
+    events: EventThread,
+    /// Commands for each registered hotkey, by hotkey index.
+    commands: Vec<Command>,
+    config_path: &'a Path,
+}
+
+impl App<'_> {
+    fn run_command(&mut self, command: Command) -> Result<ControlFlow<()>> {
+        if command == Command::ReloadConfig {
+            let config = config::load(self.config_path).context("keeping the current config")?;
+            let hotkeys;
+            (hotkeys, self.commands) = split_bindings(&config);
+            warn_failed_hotkeys(&self.events.set_hotkeys(hotkeys));
+            self.wm.set_config(config);
+            tracing::info!("reloaded config");
+            return Ok(ControlFlow::Continue(()));
+        }
+        Ok(self.wm.execute(command))
+    }
+
+    /// Handles one IPC request: `query state`, or any command in its config
+    /// file form.
+    fn answer(&mut self, line: &str) -> (Value, ControlFlow<()>) {
+        tracing::debug!(request = line, "IPC");
+        if line.trim() == "query state" {
+            return (
+                json!({ "ok": true, "state": self.wm.state() }),
+                ControlFlow::Continue(()),
+            );
+        }
+        let result = line
+            .parse::<Command>()
+            .map_err(anyhow::Error::from)
+            .and_then(|command| self.run_command(command));
+        match result {
+            Ok(flow) => (json!({ "ok": true }), flow),
+            Err(err) => (
+                json!({ "ok": false, "error": format!("{err:#}") }),
+                ControlFlow::Continue(()),
+            ),
+        }
+    }
+}
+
+fn error_json(message: &str) -> String {
+    json!({ "ok": false, "error": message }).to_string()
+}
+
+/// `rivewm msg <request>`: sends a request to the running rivewm and prints
+/// the JSON response. Exits non-zero if the request failed.
+fn msg(words: &[String]) -> Result<()> {
+    if words.is_empty() {
+        bail!("usage: rivewm msg <command>   e.g. rivewm msg workspace 3\n\n{USAGE}");
+    }
+    let response = rivewm_platform::ipc::request(&words.join(" "))?;
+    println!("{response}");
+    let ok = serde_json::from_str::<Value>(&response)
+        .ok()
+        .and_then(|v| v["ok"].as_bool())
+        .unwrap_or(false);
+    if !ok {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -176,8 +291,13 @@ fn list(all: bool) -> Result<()> {
 }
 
 fn events(all: bool) -> Result<()> {
-    let (_thread, rx) =
-        rivewm_platform::EventThread::spawn(Vec::new()).context("failed to install hooks")?;
+    let (tx, rx) = mpsc::channel();
+    let _thread = EventThread::spawn(Vec::new(), move |event| {
+        if let Event::Window(event) = event {
+            let _ = tx.send(event);
+        }
+    })
+    .context("failed to install hooks")?;
     let start = std::time::Instant::now();
 
     // Windows we've seen as manageable. Hidden/destroyed windows can no longer
@@ -192,10 +312,7 @@ fn events(all: bool) -> Result<()> {
         "Listening for window events ({} managed windows). Ctrl+C to stop.",
         known.len()
     );
-    for event in rx.into_iter().filter_map(|e| match e {
-        Event::Window(event) => Some(event),
-        Event::Hotkey(_) => None,
-    }) {
+    for event in rx {
         let id = event.window();
         let info = rivewm_platform::query_window(id);
         let manageable = info.as_ref().is_some_and(|w| w.is_manageable());

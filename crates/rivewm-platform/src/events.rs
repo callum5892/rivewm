@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -30,11 +30,14 @@ pub enum Event {
 }
 
 thread_local! {
-    /// Where the hook callback sends events. Out-of-context WinEvent hooks
-    /// are delivered on the thread that installed them, so a thread-local is
-    /// enough and avoids any global state.
-    static SENDER: RefCell<Option<Sender<Event>>> = const { RefCell::new(None) };
+    /// Where events go. Out-of-context WinEvent hooks are delivered on the
+    /// thread that installed them, so a thread-local is enough and avoids
+    /// any global state.
+    static SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
 }
+
+/// Receives every event, on the event thread.
+type Sink = Box<dyn Fn(Event) + Send>;
 
 /// Hook ranges we listen to. Two narrow ranges instead of `EVENT_MIN..MAX`
 /// so the OS doesn't marshal every accessibility event to us.
@@ -67,17 +70,21 @@ pub struct EventThread {
 }
 
 impl EventThread {
-    /// Installs the WinEvent hooks and registers `hotkeys` on a new thread,
-    /// and returns a receiver for the events they produce.
-    pub fn spawn(hotkeys: Vec<Hotkey>) -> windows::core::Result<(Self, Receiver<Event>)> {
-        let (event_tx, event_rx) = mpsc::channel();
+    /// Installs the WinEvent hooks and registers `hotkeys` on a new thread.
+    /// Every event they produce is passed to `sink` on that thread, so keep
+    /// it quick (e.g. send into a channel).
+    pub fn spawn(
+        hotkeys: Vec<Hotkey>,
+        sink: impl Fn(Event) + Send + 'static,
+    ) -> windows::core::Result<Self> {
+        let sink: Sink = Box::new(sink);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let hotkey_request = HotkeyRequest::default();
         let request = hotkey_request.clone();
 
         let join = std::thread::Builder::new()
             .name("rivewm-events".into())
-            .spawn(move || run(event_tx, ready_tx, hotkeys, request))
+            .spawn(move || run(sink, ready_tx, hotkeys, request))
             .expect("failed to spawn event thread");
 
         let (thread_id, failed_hotkeys) = ready_rx
@@ -89,7 +96,7 @@ impl EventThread {
             failed_hotkeys,
             hotkey_request,
         };
-        Ok((thread, event_rx))
+        Ok(thread)
     }
 
     /// Hotkeys from `spawn` that couldn't be registered, with the reason.
@@ -133,12 +140,12 @@ impl Drop for EventThread {
 }
 
 fn run(
-    event_tx: Sender<Event>,
+    sink: Sink,
     ready_tx: SyncSender<Ready>,
     hotkeys: Vec<Hotkey>,
     hotkey_request: HotkeyRequest,
 ) {
-    SENDER.with(|s| *s.borrow_mut() = Some(event_tx.clone()));
+    SINK.with(|s| *s.borrow_mut() = Some(sink));
 
     let mut hooks = Vec::new();
     for (min, max) in HOOK_RANGES {
@@ -170,7 +177,7 @@ fn run(
         if msg.hwnd.is_invalid() {
             match msg.message {
                 WM_HOTKEY => {
-                    let _ = event_tx.send(Event::Hotkey(msg.wParam.0));
+                    emit(Event::Hotkey(msg.wParam.0));
                     continue;
                 }
                 WM_SET_HOTKEYS => {
@@ -247,9 +254,13 @@ unsafe extern "system" fn win_event_proc(
     let Some(event) = translate(event, WindowId(hwnd.0 as isize)) else {
         return;
     };
-    SENDER.with(|s| {
-        if let Some(tx) = s.borrow().as_ref() {
-            let _ = tx.send(Event::Window(event));
+    emit(Event::Window(event));
+}
+
+fn emit(event: Event) {
+    SINK.with(|s| {
+        if let Some(sink) = s.borrow().as_ref() {
+            sink(event);
         }
     });
 }

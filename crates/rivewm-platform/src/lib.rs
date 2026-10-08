@@ -9,6 +9,7 @@
 mod cloak;
 mod events;
 mod hotkey;
+pub mod ipc;
 mod monitor;
 mod process;
 mod window;

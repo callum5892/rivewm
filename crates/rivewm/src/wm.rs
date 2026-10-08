@@ -4,13 +4,15 @@
 //! Each monitor shows one workspace; windows on the others are cloaked (see
 //! `rivewm_platform::set_cloaked`), which keeps them in the taskbar.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
-use rivewm_core::{Command, Layout, NodeId, Tree, WindowEvent, WindowId};
+use rivewm_core::tree::NodeKind;
+use rivewm_core::{Axis, Command, Layout, NodeId, Rect, Tree, WindowEvent, WindowId};
 use rivewm_platform::WindowInfo;
+use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, RuleAction};
@@ -74,6 +76,20 @@ impl Wm {
                     focus_os_window(target);
                 }
             }
+            Command::FocusWindow(id) => match self.workspace_of(id) {
+                Some(ws) if !self.tree.is_workspace_active(ws) => {
+                    self.tree.remember_focus(id);
+                    self.show_workspace(ws);
+                }
+                Some(_) => {
+                    self.tree.focus_window(id);
+                    focus_os_window(id);
+                }
+                None => warn!(
+                    window = format_args!("{:#x}", id.0),
+                    "no such managed window"
+                ),
+            },
             Command::Move(direction) => {
                 // May span two monitors, so re-tile everything.
                 if let Some(id) = focused
@@ -307,6 +323,81 @@ impl Wm {
         }
     }
 
+    /// A JSON snapshot of everything rivewm manages, for IPC clients:
+    /// monitors, their workspaces, each workspace's tiling tree and floating
+    /// windows, and what has focus. Window `id`s are what `focus-window`
+    /// takes.
+    pub fn state(&self) -> Value {
+        let tree = &self.tree;
+        let name = |ws: Option<NodeId>| ws.map(|ws| tree.workspace_name(ws));
+        let monitors: Vec<Value> = tree
+            .monitors()
+            .map(|m| {
+                let NodeKind::Monitor { id, work_area, .. } = tree.node(m).kind else {
+                    unreachable!("monitors() yields monitors");
+                };
+                let workspaces: Vec<Value> = tree
+                    .node(m)
+                    .children
+                    .iter()
+                    .map(|&ws| self.workspace_state(ws))
+                    .collect();
+                json!({
+                    "id": id.0,
+                    "work_area": rect_json(work_area),
+                    "active_workspace": name(tree.active_workspace(m)),
+                    "workspaces": workspaces,
+                })
+            })
+            .collect();
+        json!({
+            "focused_workspace": name(tree.focused_workspace()),
+            "focused_window": tree.focused_window().map(|w| w.0),
+            "monitors": monitors,
+        })
+    }
+
+    fn workspace_state(&self, ws: NodeId) -> Value {
+        let rects: HashMap<WindowId, Rect> = self
+            .tree
+            .arrange(ws, self.config.gaps)
+            .into_iter()
+            .collect();
+        let floating: Vec<Value> = self
+            .tree
+            .floating_windows(ws)
+            .into_iter()
+            .map(|(id, rect)| window_json(id, Some(rect), None))
+            .collect();
+        json!({
+            "name": self.tree.workspace_name(ws),
+            "visible": self.tree.is_workspace_active(ws),
+            "layout": format!("{:?}", self.tree.workspace_layout(ws)).to_lowercase(),
+            "focused_window": self.tree.workspace_focused_window(ws).map(|w| w.0),
+            "tiling": self.tiling_json(ws, &rects),
+            "floating": floating,
+        })
+    }
+
+    fn tiling_json(&self, node: NodeId, rects: &HashMap<WindowId, Rect>) -> Value {
+        let n = self.tree.node(node);
+        match n.kind {
+            NodeKind::Window { id, .. } => window_json(id, rects.get(&id).copied(), Some(n.weight)),
+            _ => {
+                let axis = match self.tree.container_axis(node) {
+                    Some(Axis::Horizontal) => "horizontal",
+                    _ => "vertical",
+                };
+                let children: Vec<Value> = n
+                    .children
+                    .iter()
+                    .map(|&c| self.tiling_json(c, rects))
+                    .collect();
+                json!({ "type": "split", "axis": axis, "weight": n.weight, "children": children })
+            }
+        }
+    }
+
     fn workspace_of(&self, id: WindowId) -> Option<NodeId> {
         self.tree
             .window_node(id)
@@ -418,6 +509,23 @@ impl Wm {
             }
         }
     }
+}
+
+fn window_json(id: WindowId, rect: Option<Rect>, weight: Option<f64>) -> Value {
+    let info = rivewm_platform::query_window(id);
+    json!({
+        "type": "window",
+        "id": id.0,
+        "title": info.as_ref().map(|w| w.title.as_str()),
+        "process": info.as_ref().and_then(|w| w.process.as_deref()),
+        "class": info.as_ref().map(|w| w.class.as_str()),
+        "rect": rect.map(rect_json),
+        "weight": weight,
+    })
+}
+
+fn rect_json(r: Rect) -> Value {
+    json!({ "x": r.x, "y": r.y, "width": r.width, "height": r.height })
 }
 
 fn focus_os_window(id: WindowId) {

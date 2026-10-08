@@ -1,7 +1,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::{Axis, Direction};
+use crate::{Axis, Direction, WindowId};
 
 /// Something the user asked the WM to do. Hotkeys, and later the CLI and
 /// IPC, all produce these.
@@ -11,6 +11,7 @@ use crate::{Axis, Direction};
 /// | Text                              | Command                       |
 /// |-----------------------------------|-------------------------------|
 /// | `focus left`                      | `Focus(Left)`                 |
+/// | `focus-window 0x1234`             | `FocusWindow` (hex or decimal)|
 /// | `move right`                      | `Move(Right)`                 |
 /// | `workspace 3`                     | `Workspace("3")`              |
 /// | `move-to-workspace web`           | `MoveToWorkspace("web")`      |
@@ -23,6 +24,8 @@ use crate::{Axis, Direction};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Focus(Direction),
+    /// Focus a specific window, switching to its workspace if hidden.
+    FocusWindow(WindowId),
     /// Move the focused window one step in a direction (swap, enter or
     /// leave splits, or cross monitors).
     Move(Direction),
@@ -86,6 +89,16 @@ impl FromStr for Command {
             Some("move") => Command::Move(direction(args(1)?[0])?),
             Some("workspace") => Command::Workspace(args(1)?[0].to_owned()),
             Some("move-to-workspace") => Command::MoveToWorkspace(args(1)?[0].to_owned()),
+            Some("focus-window") => {
+                let id = args(1)?[0];
+                let parsed = match id.strip_prefix("0x") {
+                    Some(hex) => isize::from_str_radix(hex, 16),
+                    None => id.parse(),
+                };
+                Command::FocusWindow(WindowId(
+                    parsed.map_err(|_| err("expected a window id like 0x1a2b or 6699"))?,
+                ))
+            }
             Some("split") => Command::Split(match args(1)?[0] {
                 "horizontal" => Axis::Horizontal,
                 "vertical" => Axis::Vertical,
@@ -135,6 +148,14 @@ mod tests {
     fn parses_every_command() {
         assert_eq!(parse("focus left"), Command::Focus(Direction::Left));
         assert_eq!(parse("move down"), Command::Move(Direction::Down));
+        assert_eq!(
+            parse("focus-window 0x1a2b"),
+            Command::FocusWindow(WindowId(0x1a2b))
+        );
+        assert_eq!(
+            parse("focus-window 6699"),
+            Command::FocusWindow(WindowId(6699))
+        );
         assert_eq!(parse("workspace 3"), Command::Workspace("3".into()));
         assert_eq!(
             parse("move-to-workspace web"),
@@ -168,6 +189,8 @@ mod tests {
             "",
             "focus",
             "focus sideways",
+            "focus-window",
+            "focus-window zz",
             "focus left now",
             "workspace",
             "split diagonal",
