@@ -6,23 +6,27 @@
 
 #![cfg(windows)]
 
+mod cloak;
 mod events;
 mod hotkey;
 mod monitor;
 mod process;
 mod window;
 
+pub use cloak::set_cloaked;
 pub use events::{Event, EventThread};
 pub use hotkey::{Hotkey, ParseHotkeyError};
 pub use monitor::{MonitorInfo, monitors};
 pub use window::{
-    Skip, WindowInfo, enumerate_windows, focus_window, foreground_window, query_window, set_frame,
-    show_window,
+    Skip, WindowInfo, enumerate_windows, focus_desktop, focus_window, foreground_window,
+    is_window_cloaked, query_window, set_frame, show_window,
 };
 
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
+/// Errors from Win32 calls.
+pub use windows::core::{Error, Result};
 
 /// Opts the process into per-monitor DPI awareness (v2) so every coordinate
 /// we read or write is in physical pixels. Must run before any window or

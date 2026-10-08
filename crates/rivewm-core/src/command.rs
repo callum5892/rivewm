@@ -8,6 +8,10 @@ pub enum Command {
     /// Move the focused window one step in a direction (swap, enter or
     /// leave splits, or cross monitors).
     Move(Direction),
+    /// Show workspace N, creating it on the focused monitor if needed.
+    Workspace(u32),
+    /// Send the focused window to workspace N.
+    MoveToWorkspace(u32),
     /// The next window opens beside the focused one along this axis.
     Split(Axis),
     /// Like `Split`, using the opposite axis of the focused window's container.

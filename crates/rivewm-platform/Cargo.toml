@@ -8,11 +8,14 @@ edition.workspace = true
 rivewm-core.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# The `interface` macro expands to `::windows_core` paths.
+windows-core = "0.62.2"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_UI_Accessibility",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
+    "Win32_System_Com",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",

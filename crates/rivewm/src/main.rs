@@ -68,6 +68,7 @@ fn run() -> Result<()> {
     })
     .context("failed to install Ctrl+C handler")?;
 
+    wm::recover_cloaked();
     let mut wm = Wm::new(Gaps { inner: 8, outer: 8 });
     wm.manage_existing();
     tracing::info!("rivewm running. Alt+Shift+E or Ctrl+C to quit.");

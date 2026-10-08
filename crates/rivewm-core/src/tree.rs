@@ -201,7 +201,7 @@ impl Tree {
         }
     }
 
-    fn monitor_of(&self, ws: NodeId) -> NodeId {
+    pub fn monitor_of(&self, ws: NodeId) -> NodeId {
         self.node(ws).parent.expect("workspace without monitor")
     }
 
@@ -268,8 +268,17 @@ impl Tree {
             axis: Axis::Horizontal,
             focus: None,
         });
+        // Keep workspaces ordered by name (numerically where possible) so a
+        // status bar can list them as-is.
+        let key = workspace_sort_key(self.workspace_name(ws));
+        let at = self
+            .node(monitor)
+            .children
+            .iter()
+            .position(|&w| workspace_sort_key(self.workspace_name(w)) > key)
+            .unwrap_or(self.node(monitor).children.len());
         self.node_mut(ws).parent = Some(monitor);
-        self.node_mut(monitor).children.push(ws);
+        self.node_mut(monitor).children.insert(at, ws);
         if let NodeKind::Monitor {
             active_workspace, ..
         } = &mut self.node_mut(monitor).kind
@@ -281,15 +290,63 @@ impl Tree {
     }
 
     /// Makes `ws` the active workspace on its monitor and gives it focus.
-    pub fn focus_workspace(&mut self, ws: NodeId) {
+    /// Returns the workspace it replaced on that monitor, if different.
+    pub fn focus_workspace(&mut self, ws: NodeId) -> Option<NodeId> {
         let monitor = self.monitor_of(ws);
+        let mut previous = None;
         if let NodeKind::Monitor {
             active_workspace, ..
         } = &mut self.node_mut(monitor).kind
         {
-            *active_workspace = Some(ws);
+            previous = active_workspace.replace(ws).filter(|&p| p != ws);
         }
         self.focused_workspace = Some(ws);
+        previous
+    }
+
+    /// Deletes an empty, inactive workspace.
+    pub fn remove_workspace(&mut self, ws: NodeId) {
+        assert!(self.node(ws).children.is_empty(), "workspace not empty");
+        assert!(!self.is_workspace_active(ws), "workspace is active");
+        self.detach(ws);
+        self.release(ws);
+    }
+
+    pub fn monitors(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.node(self.root).children.iter().copied()
+    }
+
+    pub fn monitor_by_id(&self, id: MonitorId) -> Option<NodeId> {
+        self.monitors()
+            .find(|&m| matches!(self.node(m).kind, NodeKind::Monitor { id: mid, .. } if mid == id))
+    }
+
+    /// All workspaces on all monitors.
+    pub fn workspaces(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.monitors()
+            .flat_map(|m| self.node(m).children.iter().copied())
+    }
+
+    pub fn workspace_by_name(&self, name: &str) -> Option<NodeId> {
+        self.workspaces()
+            .find(|&ws| self.workspace_name(ws) == name)
+    }
+
+    pub fn workspace_name(&self, ws: NodeId) -> &str {
+        match &self.node(ws).kind {
+            NodeKind::Workspace { name, .. } => name,
+            _ => panic!("{ws:?} is not a workspace"),
+        }
+    }
+
+    /// Whether `ws` is the one shown on its monitor.
+    pub fn is_workspace_active(&self, ws: NodeId) -> bool {
+        self.active_workspace(self.monitor_of(ws)) == Some(ws)
+    }
+
+    /// The window in `ws` that should get focus when it's shown.
+    pub fn workspace_focused_window(&self, ws: NodeId) -> Option<WindowId> {
+        self.workspace_focus(ws).map(|n| self.window_id(n))
     }
 
     // ---- Windows -----------------------------------------------------------
@@ -345,6 +402,24 @@ impl Tree {
             self.set_workspace_focus(ws, next);
         }
         ws
+    }
+
+    /// Sends a window to another workspace, placed by that workspace's
+    /// layout. Focus stays where it was: the source workspace falls back to
+    /// a neighbouring window, and the target remembers the arrival as its
+    /// focus only if it had none. Returns the source workspace.
+    pub fn move_window_to_workspace(&mut self, window: WindowId, target: NodeId) -> Option<NodeId> {
+        let node = self.window_node(window)?;
+        let source = self.workspace_of(node)?;
+        if source == target {
+            return None;
+        }
+        self.unlink_window(node);
+        self.layout_insert(target, node);
+        if self.workspace_focus(target).is_none() {
+            self.set_workspace_focus(target, Some(node));
+        }
+        Some(source)
     }
 
     /// Moves `window` one step in `direction`, i3 style:
@@ -490,6 +565,17 @@ impl Tree {
         let ws = self.workspace_of(node).expect("window outside a workspace");
         self.set_workspace_focus(ws, Some(node));
         self.focus_workspace(ws);
+        true
+    }
+
+    /// Makes `window` its workspace's remembered focus without showing or
+    /// focusing that workspace.
+    pub fn remember_focus(&mut self, window: WindowId) -> bool {
+        let Some(node) = self.window_node(window) else {
+            return false;
+        };
+        let ws = self.workspace_of(node).expect("window outside a workspace");
+        self.set_workspace_focus(ws, Some(node));
         true
     }
 
@@ -681,7 +767,7 @@ impl Tree {
         neighbour(self.monitor_work_area(monitor), others, direction)
     }
 
-    fn active_workspace(&self, monitor: NodeId) -> Option<NodeId> {
+    pub fn active_workspace(&self, monitor: NodeId) -> Option<NodeId> {
         match self.node(monitor).kind {
             NodeKind::Monitor {
                 active_workspace, ..
@@ -886,6 +972,11 @@ fn neighbour<T: Copy>(
         })
         .min_by_key(|&(score, _)| score)
         .map(|(_, id)| id)
+}
+
+/// Numeric names sort numerically ("2" < "10") and before other names.
+fn workspace_sort_key(name: &str) -> (u64, String) {
+    (name.parse().unwrap_or(u64::MAX), name.to_owned())
 }
 
 fn overlaps(a_start: i32, a_end: i32, b_start: i32, b_end: i32) -> bool {
@@ -1289,6 +1380,79 @@ mod tests {
         assert!(tree.move_in_direction(w(1), Direction::Left));
         assert_eq!(tree.debug_layout(ws1), "H[1]");
         assert_eq!(tree.focused_workspace(), Some(ws1));
+    }
+
+    #[test]
+    fn workspaces_are_sorted_and_found_by_name() {
+        let (mut tree, ws1) = setup();
+        let mon = tree.monitor_of(ws1);
+        tree.add_workspace(mon, "10", Layout::Manual);
+        tree.add_workspace(mon, "web", Layout::Manual);
+        tree.add_workspace(mon, "2", Layout::Manual);
+        let names: Vec<_> = tree
+            .workspaces()
+            .map(|ws| tree.workspace_name(ws))
+            .collect();
+        assert_eq!(names, ["1", "2", "10", "web"]);
+        assert_eq!(tree.workspace_by_name("1"), Some(ws1));
+        assert_eq!(tree.workspace_by_name("3"), None);
+    }
+
+    #[test]
+    fn focusing_workspace_swaps_active_on_its_monitor() {
+        let (mut tree, ws1) = setup();
+        let mon = tree.monitor_of(ws1);
+        let ws2 = tree.add_workspace(mon, "2", Layout::Manual);
+        assert!(tree.is_workspace_active(ws1));
+        assert!(!tree.is_workspace_active(ws2));
+
+        assert_eq!(tree.focus_workspace(ws2), Some(ws1));
+        assert!(tree.is_workspace_active(ws2));
+        assert!(!tree.is_workspace_active(ws1));
+        assert_eq!(tree.focused_workspace(), Some(ws2));
+        // Re-focusing the active workspace replaces nothing.
+        assert_eq!(tree.focus_workspace(ws2), None);
+    }
+
+    #[test]
+    fn empty_inactive_workspace_can_be_removed() {
+        let (mut tree, ws1) = setup();
+        let mon = tree.monitor_of(ws1);
+        let ws2 = tree.add_workspace(mon, "2", Layout::Manual);
+        tree.remove_workspace(ws2);
+        assert_eq!(tree.workspace_by_name("2"), None);
+        assert_eq!(tree.workspaces().count(), 1);
+    }
+
+    #[test]
+    fn move_window_to_workspace_keeps_source_focus_sensible() {
+        let (mut tree, ws1) = setup();
+        let mon = tree.monitor_of(ws1);
+        let ws2 = tree.add_workspace(mon, "2", Layout::Manual);
+        open(&mut tree, ws1, &[1, 2, 3]);
+        tree.focus_window(w(2));
+
+        assert_eq!(tree.move_window_to_workspace(w(2), ws2), Some(ws1));
+        assert_eq!(tree.debug_layout(ws1), "H[1 3]");
+        assert_eq!(tree.debug_layout(ws2), "H[2]");
+        // Source falls back to the neighbour; target remembers the arrival.
+        assert_eq!(tree.focused_window(), Some(w(3)));
+        assert_eq!(tree.workspace_focused_window(ws2), Some(w(2)));
+
+        // Arrivals go next to the target's focused window.
+        tree.move_window_to_workspace(w(1), ws2);
+        assert_eq!(tree.debug_layout(ws2), "H[2 1]");
+        assert_eq!(tree.workspace_focused_window(ws2), Some(w(2)));
+
+        assert_eq!(tree.move_window_to_workspace(w(1), ws2), None);
+    }
+
+    #[test]
+    fn monitors_can_be_found_by_os_id() {
+        let (tree, ws1, ws2) = setup_dual();
+        assert_eq!(tree.monitor_by_id(MonitorId(2)), Some(tree.monitor_of(ws2)));
+        assert_eq!(tree.monitor_by_id(MonitorId(1)), Some(tree.monitor_of(ws1)));
+        assert_eq!(tree.monitor_by_id(MonitorId(9)), None);
     }
 
     #[test]

@@ -6,10 +6,10 @@ const RESIZE_STEP: f64 = 0.05;
 
 /// `(hotkey, command)` pairs. Hotkeys are strings so a config file can use
 /// the same format.
-pub fn defaults() -> Vec<(&'static str, Command)> {
+pub fn defaults() -> Vec<(String, Command)> {
     use Command::*;
     use Direction::*;
-    vec![
+    let mut bindings: Vec<(String, Command)> = [
         ("alt+h", Focus(Left)),
         ("alt+j", Focus(Down)),
         ("alt+k", Focus(Up)),
@@ -38,6 +38,15 @@ pub fn defaults() -> Vec<(&'static str, Command)> {
         ("alt+shift+r", Retile),
         ("alt+shift+e", Quit),
     ]
+    .into_iter()
+    .map(|(key, command)| (key.to_owned(), command))
+    .collect();
+
+    for n in 1..=9 {
+        bindings.push((format!("alt+{n}"), Workspace(n)));
+        bindings.push((format!("alt+shift+{n}"), MoveToWorkspace(n)));
+    }
+    bindings
 }
 
 fn resize(axis: Axis, delta: f64) -> Command {

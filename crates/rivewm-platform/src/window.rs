@@ -7,12 +7,12 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetForegroundWindow, GetWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-    IsWindowVisible, IsZoomed, SW_RESTORE, SW_SHOWNA, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
-    SWP_NOOWNERZORDER, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_THICKFRAME,
+    EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetForegroundWindow,
+    GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SW_RESTORE, SW_SHOWNA,
+    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetForegroundWindow,
+    SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
 use windows::core::BOOL;
 
@@ -104,6 +104,20 @@ fn hwnd(id: WindowId) -> HWND {
 pub fn foreground_window() -> Option<WindowId> {
     let hwnd = unsafe { GetForegroundWindow() };
     (!hwnd.is_invalid()).then_some(WindowId(hwnd.0 as isize))
+}
+
+/// Gives keyboard focus to the desktop, so keys don't go to a window that
+/// was just cloaked.
+pub fn focus_desktop() -> bool {
+    unsafe {
+        let desktop = GetShellWindow();
+        !desktop.is_invalid() && SetForegroundWindow(desktop).as_bool()
+    }
+}
+
+/// Whether DWM currently has the window cloaked, by us or anyone else.
+pub fn is_window_cloaked(id: WindowId) -> bool {
+    is_cloaked(hwnd(id))
 }
 
 /// Gives a window keyboard focus. Returns `false` if Windows refused, which
