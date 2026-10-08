@@ -1,3 +1,4 @@
+mod background;
 mod config;
 mod subscribe;
 mod wm;
@@ -11,7 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use config::Config;
 use rivewm_core::{Command, WindowEvent, WindowId};
-use rivewm_platform::{Event, EventThread, Hotkey};
+use rivewm_platform::{Event, EventThread, Hotkey, TrayAction};
 use serde_json::{Value, json};
 use subscribe::Snapshot;
 use tracing_subscriber::EnvFilter;
@@ -21,9 +22,15 @@ const USAGE: &str = "\
 rivewm - a tiling window manager for Windows
 
 USAGE:
-    rivewm [--config <path>] Run the window manager (Ctrl+C to quit). The
-                             config defaults to ~\\.config\\rivewm\\config.toml
-                             and is created on first run.
+    rivewm [--config <path>] Run the window manager in this terminal (Ctrl+C
+                             to quit). The config defaults to
+                             ~\\.config\\rivewm\\config.toml and is created on
+                             first run.
+    rivewm --background      Run it detached from the terminal, with a tray
+                             icon. Logs go to %LOCALAPPDATA%\\rivewm\\rivewm.log
+    rivewm --autostart [on|off]
+                             Start rivewm in the background at login (or show
+                             whether it will)
     rivewm msg <request>     Send a request to the running rivewm and print
                              its JSON reply. A request is any config command
                              (e.g. `workspace 3`, `focus-window 0x1a2b`) or
@@ -37,14 +44,21 @@ USAGE:
 ";
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let daemon = args.first().is_some_and(|a| a == "--daemon");
+    if daemon {
+        // Launched from the Run key we'd still get a console window; drop it.
+        rivewm_platform::detach_console();
+        background::init_file_logging()?;
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+            .init();
+    }
 
     rivewm_platform::enable_dpi_awareness()
         .context("failed to enable per-monitor DPI awareness")?;
 
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
     let config_path = match args.iter().position(|a| a == "--config") {
         Some(i) => {
             args.remove(i);
@@ -56,6 +70,14 @@ fn main() -> Result<()> {
         None => config::default_path(),
     };
     match args.first().map(String::as_str) {
+        Some("--daemon") => run(&config_path).inspect_err(|err| {
+            // No console to print to; make sure it reaches the log.
+            tracing::error!("{err:#}");
+        }),
+        Some("--background") => background::start(&config_path),
+        Some("--autostart") => {
+            background::autostart_cli(args.get(1).map(String::as_str), &config_path)
+        }
         Some("msg") => msg(&args[1..]),
         Some("--list") => list(args.iter().any(|a| a == "--all")),
         Some("--events") => events(args.iter().any(|a| a == "--all")),
@@ -127,7 +149,7 @@ fn run(config_path: &Path) -> Result<()> {
     );
 
     // Hooks next, so no window that opens during startup is missed.
-    let events = rivewm_platform::EventThread::spawn(hotkeys, move |event| {
+    let events = rivewm_platform::EventThread::spawn(hotkeys, true, move |event| {
         let _ = tx.send(Msg::Event(event));
     })
     .context("failed to install hooks")?;
@@ -136,6 +158,8 @@ fn run(config_path: &Path) -> Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         wm::restore_all();
+        // The background process has no console, so log it as well.
+        tracing::error!("{info}");
         default_hook(info);
     }));
     ctrlc::set_handler(|| {
@@ -187,6 +211,7 @@ fn run(config_path: &Path) -> Result<()> {
                 resync_monitors_at = Some(Instant::now() + DISPLAY_SETTLE_TIME);
                 ControlFlow::Continue(())
             }
+            Msg::Event(Event::Tray(action)) => app.tray(action),
             Msg::Event(Event::Hotkey(i)) => match app.commands.get(i).cloned() {
                 Some(command) => app.run_command(command).unwrap_or_else(|err| {
                     tracing::error!("{err:#}");
@@ -274,6 +299,36 @@ impl App<'_> {
         let line = event.to_string();
         self.subscribers
             .retain(|s| s.try_send(line.clone()).is_ok());
+    }
+
+    /// Acts on a pick from the tray icon's menu.
+    fn tray(&mut self, action: TrayAction) -> ControlFlow<()> {
+        match action {
+            TrayAction::ReloadConfig => {
+                if let Err(err) = self.run_command(Command::ReloadConfig) {
+                    tracing::error!("{err:#}");
+                }
+            }
+            TrayAction::OpenConfig => rivewm_platform::open_file(self.config_path),
+            TrayAction::OpenLog => {
+                let log = background::log_path();
+                if log.exists() {
+                    rivewm_platform::open_file(&log);
+                } else {
+                    tracing::warn!(
+                        "no log file: rivewm logs to its terminal unless started with --background"
+                    );
+                }
+            }
+            TrayAction::ToggleAutostart => {
+                let enable = !rivewm_platform::autostart::is_enabled();
+                if let Err(err) = background::set_autostart(enable, self.config_path) {
+                    tracing::error!("{err:#}");
+                }
+            }
+            TrayAction::Quit => return ControlFlow::Break(()),
+        }
+        ControlFlow::Continue(())
     }
 
     /// Handles one IPC request: `query state`, or any command in its config
@@ -397,7 +452,7 @@ fn list(all: bool) -> Result<()> {
 
 fn events(all: bool) -> Result<()> {
     let (tx, rx) = mpsc::channel();
-    let _thread = EventThread::spawn(Vec::new(), move |event| {
+    let _thread = EventThread::spawn(Vec::new(), false, move |event| {
         if let Event::Window(event) = event {
             let _ = tx.send(event);
         }

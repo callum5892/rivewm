@@ -6,18 +6,21 @@
 
 #![cfg(windows)]
 
+pub mod autostart;
 mod cloak;
 mod events;
 mod hotkey;
 pub mod ipc;
 mod monitor;
 mod process;
+mod tray;
 mod window;
 
 pub use cloak::set_cloaked;
 pub use events::{Event, EventThread, FailedHotkeys};
 pub use hotkey::{Hotkey, ParseHotkeyError};
 pub use monitor::{MonitorInfo, monitors};
+pub use tray::{TrayAction, open_file};
 pub use window::{
     Skip, WindowInfo, cursor_position, enumerate_windows, focus_desktop, focus_window,
     foreground_window, is_topmost, is_window_cloaked, query_window, raise_window, set_frame,
@@ -47,4 +50,13 @@ pub fn enable_dpi_awareness() -> windows::core::Result<()> {
 fn from_wide(buf: &[u16]) -> String {
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..len])
+}
+
+/// Detaches from the console this process was started with, closing its
+/// window if nothing else shares it. Used by the background process, which
+/// may be launched from the Run registry key with a console of its own.
+pub fn detach_console() {
+    unsafe {
+        let _ = windows::Win32::System::Console::FreeConsole();
+    }
 }

@@ -22,6 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::w;
 
 use crate::Hotkey;
+use crate::tray::{self, TrayAction};
 
 /// Everything the event thread reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,8 @@ pub enum Event {
     /// Monitors were connected, disconnected, rearranged or resized, or the
     /// taskbar changed the work area. Windows sends these in bursts.
     DisplayChanged,
+    /// Something was picked from the tray icon's menu.
+    Tray(TrayAction),
 }
 
 thread_local! {
@@ -41,6 +44,8 @@ thread_local! {
     /// thread that installed them, so a thread-local is enough and avoids
     /// any global state.
     static SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
+    /// Whether this thread shows a tray icon.
+    static SHOW_TRAY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Receives every event, on the event thread.
@@ -80,8 +85,10 @@ impl EventThread {
     /// Installs the WinEvent hooks and registers `hotkeys` on a new thread.
     /// Every event they produce is passed to `sink` on that thread, so keep
     /// it quick (e.g. send into a channel).
+    /// With `tray`, it also shows the notification-area icon.
     pub fn spawn(
         hotkeys: Vec<Hotkey>,
+        tray: bool,
         sink: impl Fn(Event) + Send + 'static,
     ) -> windows::core::Result<Self> {
         let sink: Sink = Box::new(sink);
@@ -91,7 +98,7 @@ impl EventThread {
 
         let join = std::thread::Builder::new()
             .name("rivewm-events".into())
-            .spawn(move || run(sink, ready_tx, hotkeys, request))
+            .spawn(move || run(sink, ready_tx, hotkeys, request, tray))
             .expect("failed to spawn event thread");
 
         let (thread_id, failed_hotkeys) = ready_rx
@@ -151,8 +158,10 @@ fn run(
     ready_tx: SyncSender<Ready>,
     hotkeys: Vec<Hotkey>,
     hotkey_request: HotkeyRequest,
+    show_tray: bool,
 ) {
     SINK.with(|s| *s.borrow_mut() = Some(sink));
+    SHOW_TRAY.set(show_tray);
 
     let mut hooks = Vec::new();
     for (min, max) in HOOK_RANGES {
@@ -175,9 +184,13 @@ fn run(
         hooks.push(hook);
     }
 
-    // Display changes are only broadcast to top-level windows, so keep a
-    // hidden one. Without it rivewm still works, just without hot-plug.
-    let display_window = create_display_window();
+    // Display changes are only broadcast to top-level windows, and the tray
+    // icon needs a window to report clicks to, so keep a hidden one.
+    // Without it rivewm still works, just without hot-plug or a tray icon.
+    let notify_window = create_notify_window();
+    if show_tray && let Some(window) = notify_window {
+        tray::add_icon(window);
+    }
 
     let (mut registered, failed) = register_hotkeys(&hotkeys);
     let _ = ready_tx.send(Ok((unsafe { GetCurrentThreadId() }, failed)));
@@ -215,7 +228,10 @@ fn run(
 
     unregister_hotkeys(&registered);
     unhook_all(&hooks);
-    if let Some(window) = display_window {
+    if let Some(window) = notify_window {
+        if show_tray {
+            tray::remove_icon(window);
+        }
         unsafe {
             let _ = DestroyWindow(window);
         }
@@ -300,13 +316,13 @@ fn translate(event: u32, id: WindowId) -> Option<WindowEvent> {
 }
 
 /// A hidden window that turns display-change broadcasts into
-/// [`Event::DisplayChanged`].
-fn create_display_window() -> Option<HWND> {
+/// [`Event::DisplayChanged`] and hosts the tray icon.
+fn create_notify_window() -> Option<HWND> {
     unsafe {
         let instance = GetModuleHandleW(None).ok()?;
         let class = w!("rivewm-display-listener");
         let wc = WNDCLASSW {
-            lpfnWndProc: Some(display_wndproc),
+            lpfnWndProc: Some(notify_wndproc),
             hInstance: instance.into(),
             lpszClassName: class,
             ..Default::default()
@@ -331,7 +347,7 @@ fn create_display_window() -> Option<HWND> {
     }
 }
 
-unsafe extern "system" fn display_wndproc(
+unsafe extern "system" fn notify_wndproc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
@@ -340,6 +356,15 @@ unsafe extern "system" fn display_wndproc(
     let work_area_changed = msg == WM_SETTINGCHANGE && wparam.0 as u32 == SPI_SETWORKAREA.0;
     if msg == WM_DISPLAYCHANGE || work_area_changed {
         emit(Event::DisplayChanged);
+    }
+    if msg == tray::WM_TRAY
+        && let Some(action) = tray::on_notify(hwnd, wparam, lparam)
+    {
+        emit(Event::Tray(action));
+    }
+    if msg == tray::taskbar_created_message() && SHOW_TRAY.get() {
+        // Explorer restarted and forgot our icon.
+        tray::add_icon(hwnd);
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
