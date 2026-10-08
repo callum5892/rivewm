@@ -4,7 +4,8 @@
 //! Each monitor shows one workspace; windows on the others are cloaked (see
 //! `rivewm_platform::set_cloaked`), which keeps them in the taskbar.
 
-use std::collections::{BTreeSet, HashMap};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -35,6 +36,11 @@ pub struct Wm {
     config: Config,
     /// Fullscreen windows as of the last time we positioned them.
     fullscreen: BTreeSet<WindowId>,
+    /// Windows Windows refused to let us move during the current operation;
+    /// released once it finishes. (`apply` only borrows `self`.)
+    refused: RefCell<Vec<WindowId>>,
+    /// Windows released for that reason, so they aren't managed again.
+    unmovable: HashSet<WindowId>,
 }
 
 /// Where a dragged tiled window was dropped.
@@ -60,6 +66,8 @@ impl Wm {
             tree,
             config,
             fullscreen: BTreeSet::new(),
+            refused: RefCell::new(Vec::new()),
+            unmovable: HashSet::new(),
         }
     }
 
@@ -137,6 +145,7 @@ impl Wm {
     pub fn execute(&mut self, command: Command) -> ControlFlow<()> {
         let flow = self.run(command);
         self.sync_fullscreen();
+        self.release_refused();
         flow
     }
 
@@ -246,6 +255,7 @@ impl Wm {
     pub fn handle(&mut self, event: WindowEvent) {
         self.on_event(event);
         self.sync_fullscreen();
+        self.release_refused();
     }
 
     fn on_event(&mut self, event: WindowEvent) {
@@ -256,9 +266,11 @@ impl Wm {
             | WindowEvent::Restored(id)
             // Some apps show their window before giving it a title.
             | WindowEvent::TitleChanged(id) => self.try_manage(id),
-            WindowEvent::Hidden(id) | WindowEvent::Destroyed(id) | WindowEvent::Minimized(id) => {
-                self.unmanage(id)
+            WindowEvent::Destroyed(id) => {
+                self.unmovable.remove(&id);
+                self.unmanage(id);
             }
+            WindowEvent::Hidden(id) | WindowEvent::Minimized(id) => self.unmanage(id),
             WindowEvent::Cloaked(id) => {
                 // Our own cloaking reports back here too. Only a window on a
                 // visible workspace that is *still* cloaked now (e.g. moved
@@ -472,6 +484,24 @@ impl Wm {
         Some(Drop::Beside(target, side))
     }
 
+    /// Lets go of windows Windows wouldn't let us move, so the rest of the
+    /// layout closes up instead of leaving a gap. Classification already
+    /// skips windows of elevated processes; this catches anything else that
+    /// turns out to be out of reach, and remembers it until it closes.
+    fn release_refused(&mut self) {
+        let refused = std::mem::take(&mut *self.refused.borrow_mut());
+        for id in refused {
+            if self.unmovable.insert(id) {
+                warn!(
+                    window = format_args!("{:#x}", id.0),
+                    "Windows won't let rivewm move this window (is it running as \
+                     administrator?); leaving it alone"
+                );
+                self.unmanage(id);
+            }
+        }
+    }
+
     /// Positions windows after fullscreen started or ended, however that
     /// happened: the command, or implicitly when focus moved on or the
     /// window closed.
@@ -663,7 +693,7 @@ impl Wm {
     }
 
     fn try_manage(&mut self, id: WindowId) {
-        if self.tree.contains_window(id) {
+        if self.tree.contains_window(id) || self.unmovable.contains(&id) {
             return;
         }
         let Some(info) = rivewm_platform::query_window(id) else {
@@ -764,9 +794,14 @@ impl Wm {
 
     fn apply(&self, ws: NodeId) {
         for (id, rect) in self.tree.arrange(ws, self.config.gaps) {
-            if let Err(err) = rivewm_platform::set_frame(id, rect) {
-                // Typically an elevated window we aren't allowed to move.
-                warn!(window = format_args!("{:#x}", id.0), %err, "failed to position window");
+            match rivewm_platform::set_frame(id, rect) {
+                Ok(()) => {}
+                Err(err) if rivewm_platform::is_access_denied(&err) => {
+                    self.refused.borrow_mut().push(id);
+                }
+                Err(err) => {
+                    warn!(window = format_args!("{:#x}", id.0), %err, "failed to position window");
+                }
             }
         }
         if let Some(id) = self.tree.fullscreen_window(ws) {

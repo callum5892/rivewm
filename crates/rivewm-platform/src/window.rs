@@ -19,7 +19,7 @@ use windows::core::BOOL;
 
 use crate::from_wide;
 use crate::monitor::rect_from_win32;
-use crate::process::process_name;
+use crate::process::{is_out_of_reach, process_name};
 
 /// Why a top-level window is not a tiling candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +34,9 @@ pub enum Skip {
     /// Neither a caption nor a resizable frame, e.g. splash screens.
     NoFrame,
     ZeroSize,
+    /// Runs as administrator while rivewm doesn't, so Windows won't let us
+    /// move it (e.g. Task Manager).
+    Elevated,
 }
 
 impl std::fmt::Display for Skip {
@@ -44,6 +47,7 @@ impl std::fmt::Display for Skip {
             Skip::Child => "child",
             Skip::ToolWindow => "tool-window",
             Skip::NoActivate => "no-activate",
+            Skip::Elevated => "elevated",
             Skip::NoTitle => "no-title",
             Skip::NoFrame => "no-frame",
             Skip::ZeroSize => "zero-size",
@@ -239,7 +243,7 @@ fn window_info(hwnd: HWND) -> WindowInfo {
     let window_rect = window_rect(hwnd).unwrap_or_default();
     let frame = extended_frame_bounds(hwnd).unwrap_or(window_rect);
     let title = window_title(hwnd);
-    let (skip, floating) = match classify(hwnd, &title, frame) {
+    let (skip, floating) = match classify(hwnd, pid, &title, frame) {
         Ok(floating) => (None, floating),
         Err(skip) => (Some(skip), false),
     };
@@ -260,7 +264,7 @@ fn window_info(hwnd: HWND) -> WindowInfo {
 
 /// Decides how to treat a window: `Err` to leave it alone, otherwise
 /// whether it should float.
-fn classify(hwnd: HWND, title: &str, frame: Rect) -> Result<bool, Skip> {
+fn classify(hwnd: HWND, pid: u32, title: &str, frame: Rect) -> Result<bool, Skip> {
     let style = WINDOW_STYLE(unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32);
     let ex_style = WINDOW_EX_STYLE(unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32);
 
@@ -287,6 +291,10 @@ fn classify(hwnd: HWND, title: &str, frame: Rect) -> Result<bool, Skip> {
     }
     if frame.is_empty() {
         return Err(Skip::ZeroSize);
+    }
+    // Last, as it's the most expensive check.
+    if is_out_of_reach(pid) {
+        return Err(Skip::Elevated);
     }
     let owned = unsafe { GetWindow(hwnd, GW_OWNER) }.is_ok_and(|owner| !owner.is_invalid());
     Ok(owned || !style.contains(WS_THICKFRAME))

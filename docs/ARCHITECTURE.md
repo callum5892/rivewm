@@ -67,7 +67,10 @@ ad-hoc tree edits in command handlers.
 - **DPI** — the process is per-monitor-v2 aware; all coordinates are physical.
 - **Minimized windows** report `-32000,-32000`; their real size comes from
   `GetWindowPlacement`.
-- **Elevated windows** can't be moved unless rivewm is elevated (UIPI).
+- **Elevated windows** (e.g. Task Manager) can't be moved unless rivewm is
+  elevated too (UIPI). They're classified `Skip::Elevated` and left alone;
+  as a backstop, any window whose move fails with access denied is released
+  and not managed again until it closes.
 - **Inactive workspaces are cloaked**, via the shell's undocumented
   `IApplicationView::SetCloak` (`rivewm-platform/src/cloak.rs`), so their
   windows keep taskbar buttons and Alt+Tab entries. Our cloaks echo back as

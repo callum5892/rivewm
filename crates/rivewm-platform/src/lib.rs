@@ -30,6 +30,12 @@ use windows::Win32::UI::HiDpi::{
 /// Errors from Win32 calls.
 pub use windows::core::{Error, Result};
 
+/// Whether a Win32 call failed because Windows denied access, e.g. moving a
+/// window that belongs to an elevated process.
+pub fn is_access_denied(err: &Error) -> bool {
+    err.code() == windows::Win32::Foundation::ERROR_ACCESS_DENIED.to_hresult()
+}
+
 /// Opts the process into per-monitor DPI awareness (v2) so every coordinate
 /// we read or write is in physical pixels. Must run before any window or
 /// monitor API is used.
