@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, RuleAction};
+use crate::subscribe::{Snapshot, WorkspaceSnapshot};
 
 /// Every window we currently manage, kept outside `Wm` so the Ctrl+C handler
 /// and panic hook can still restore them when `Wm` is unreachable.
@@ -355,6 +356,39 @@ impl Wm {
             "focused_window": tree.focused_window().map(|w| w.0),
             "monitors": monitors,
         })
+    }
+
+    /// A cheap summary of state for deriving subscriber events. Only the
+    /// focused window's title needs an OS call.
+    pub fn snapshot(&self) -> Snapshot {
+        let tree = &self.tree;
+        let workspaces = tree
+            .monitors()
+            .flat_map(|m| {
+                let NodeKind::Monitor { id, .. } = tree.node(m).kind else {
+                    unreachable!("monitors() yields monitors");
+                };
+                tree.node(m).children.iter().map(move |&ws| {
+                    let mut windows = tree.arrange(ws, self.config.gaps);
+                    windows.extend(tree.floating_windows(ws));
+                    WorkspaceSnapshot {
+                        name: tree.workspace_name(ws).to_owned(),
+                        monitor: id,
+                        visible: tree.is_workspace_active(ws),
+                        windows,
+                    }
+                })
+            })
+            .collect();
+        Snapshot {
+            focused_workspace: tree
+                .focused_workspace()
+                .map(|ws| tree.workspace_name(ws).to_owned()),
+            focused_window: tree
+                .focused_window()
+                .map(|id| (id, rivewm_platform::title(id))),
+            workspaces,
+        }
     }
 
     fn workspace_state(&self, ws: NodeId) -> Value {

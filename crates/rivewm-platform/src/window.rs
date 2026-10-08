@@ -114,6 +114,11 @@ pub fn focus_desktop() -> bool {
     }
 }
 
+/// A window's title. Much cheaper than [`query_window`].
+pub fn title(id: WindowId) -> String {
+    window_title(hwnd(id))
+}
+
 /// Whether DWM currently has the window cloaked, by us or anyone else.
 pub fn is_window_cloaked(id: WindowId) -> bool {
     is_cloaked(hwnd(id))

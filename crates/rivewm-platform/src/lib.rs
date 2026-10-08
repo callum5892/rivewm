@@ -20,7 +20,7 @@ pub use hotkey::{Hotkey, ParseHotkeyError};
 pub use monitor::{MonitorInfo, monitors};
 pub use window::{
     Skip, WindowInfo, enumerate_windows, focus_desktop, focus_window, foreground_window,
-    is_window_cloaked, query_window, set_frame, show_window,
+    is_window_cloaked, query_window, set_frame, show_window, title,
 };
 
 use windows::Win32::UI::HiDpi::{

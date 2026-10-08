@@ -1,4 +1,5 @@
 mod config;
+mod subscribe;
 mod wm;
 
 use std::collections::HashSet;
@@ -12,6 +13,7 @@ use config::Config;
 use rivewm_core::{Command, WindowEvent, WindowId};
 use rivewm_platform::{Event, EventThread, Hotkey};
 use serde_json::{Value, json};
+use subscribe::Snapshot;
 use tracing_subscriber::EnvFilter;
 use wm::Wm;
 
@@ -26,7 +28,8 @@ USAGE:
                              its JSON reply. A request is any config command
                              (e.g. `workspace 3`, `focus-window 0x1a2b`) or
                              `query state` for monitors, workspaces, layout
-                             and windows.
+                             and windows, or `subscribe` to stream events
+                             (one JSON line each) until interrupted.
     rivewm --list [--all]    List monitors and the windows rivewm manages
                              (--all also shows skipped windows and why)
     rivewm --events [--all]  Log window events live until Ctrl+C
@@ -70,7 +73,12 @@ enum Msg {
     Event(Event),
     /// An IPC request line, and where to send the response line.
     Request(String, SyncSender<String>),
+    /// An IPC client subscribed; send it event lines here.
+    Subscribe(SyncSender<String>),
 }
+
+/// Events a subscriber may have queued before we drop it as too slow.
+const SUBSCRIBER_BACKLOG: usize = 256;
 
 fn run(config_path: &Path) -> Result<()> {
     let config = config::load(config_path)?;
@@ -81,17 +89,34 @@ fn run(config_path: &Path) -> Result<()> {
     // The IPC pipe goes first: it doubles as the check that no other rivewm
     // is running, before we touch any windows.
     let ipc_tx = tx.clone();
-    rivewm_platform::ipc::serve(move |line| {
+    rivewm_platform::ipc::serve(move |line, conn| {
+        if line.trim() == "subscribe" {
+            // Runs on this client's own thread until it disconnects.
+            let (events_tx, events_rx) = mpsc::sync_channel(SUBSCRIBER_BACKLOG);
+            if ipc_tx.send(Msg::Subscribe(events_tx)).is_err()
+                || conn.send_line(&json!({ "ok": true }).to_string()).is_err()
+            {
+                return;
+            }
+            for event in events_rx {
+                if conn.send_line(&event).is_err() {
+                    break;
+                }
+            }
+            return;
+        }
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        if ipc_tx
+        let response = if ipc_tx
             .send(Msg::Request(line.to_owned(), reply_tx))
             .is_err()
         {
-            return error_json("rivewm is shutting down");
-        }
-        reply_rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap_or_else(|_| error_json("rivewm didn't respond in time"))
+            error_json("rivewm is shutting down")
+        } else {
+            reply_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| error_json("rivewm didn't respond in time"))
+        };
+        let _ = conn.send_line(&response);
     })?;
     tracing::info!(
         pipe = rivewm_platform::ipc::pipe_name(),
@@ -127,6 +152,8 @@ fn run(config_path: &Path) -> Result<()> {
         events,
         commands,
         config_path,
+        subscribers: Vec::new(),
+        last_snapshot: Snapshot::default(),
     };
     for msg in rx {
         let flow = match msg {
@@ -146,7 +173,12 @@ fn run(config_path: &Path) -> Result<()> {
                 let _ = reply.send(response.to_string());
                 flow
             }
+            Msg::Subscribe(subscriber) => {
+                app.subscribe(subscriber);
+                ControlFlow::Continue(())
+            }
         };
+        app.publish_changes();
         if flow.is_break() {
             break;
         }
@@ -163,6 +195,11 @@ struct App<'a> {
     /// Commands for each registered hotkey, by hotkey index.
     commands: Vec<Command>,
     config_path: &'a Path,
+    /// IPC clients receiving events.
+    subscribers: Vec<SyncSender<String>>,
+    /// State as of the last events sent, for diffing. Only kept current
+    /// while there are subscribers.
+    last_snapshot: Snapshot,
 }
 
 impl App<'_> {
@@ -174,9 +211,43 @@ impl App<'_> {
             warn_failed_hotkeys(&self.events.set_hotkeys(hotkeys));
             self.wm.set_config(config);
             tracing::info!("reloaded config");
+            self.broadcast(&json!({ "event": "config_reloaded" }));
             return Ok(ControlFlow::Continue(()));
         }
         Ok(self.wm.execute(command))
+    }
+
+    fn subscribe(&mut self, subscriber: SyncSender<String>) {
+        if self.subscribers.is_empty() {
+            // Nobody was watching, so the last snapshot is stale.
+            self.last_snapshot = self.wm.snapshot();
+        }
+        self.subscribers.push(subscriber);
+        tracing::debug!(count = self.subscribers.len(), "IPC subscriber added");
+    }
+
+    /// Sends subscribers an event for everything that changed since the last
+    /// call. Free when nobody is subscribed.
+    fn publish_changes(&mut self) {
+        if self.subscribers.is_empty() {
+            return;
+        }
+        let snapshot = self.wm.snapshot();
+        if snapshot == self.last_snapshot {
+            return;
+        }
+        for event in subscribe::diff(&self.last_snapshot, &snapshot) {
+            self.broadcast(&event);
+        }
+        self.last_snapshot = snapshot;
+    }
+
+    /// Sends one event to every subscriber, dropping any that have gone away
+    /// or fallen too far behind to keep up.
+    fn broadcast(&mut self, event: &Value) {
+        let line = event.to_string();
+        self.subscribers
+            .retain(|s| s.try_send(line.clone()).is_ok());
     }
 
     /// Handles one IPC request: `query state`, or any command in its config
@@ -213,7 +284,15 @@ fn msg(words: &[String]) -> Result<()> {
     if words.is_empty() {
         bail!("usage: rivewm msg <command>   e.g. rivewm msg workspace 3\n\n{USAGE}");
     }
-    let response = rivewm_platform::ipc::request(&words.join(" "))?;
+    let request = words.join(" ");
+    if request == "subscribe" {
+        // Print events as they arrive until rivewm goes away.
+        for line in rivewm_platform::ipc::stream(&request)? {
+            println!("{}", line?);
+        }
+        return Ok(());
+    }
+    let response = rivewm_platform::ipc::request(&request)?;
     println!("{response}");
     let ok = serde_json::from_str::<Value>(&response)
         .ok()

@@ -10,11 +10,12 @@ use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL,
-    LocalFree,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+    ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL, LocalFree,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -27,8 +28,8 @@ use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, FlushFileBuffers, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::{HSTRING, PWSTR};
@@ -61,10 +62,29 @@ impl std::fmt::Display for ServeError {
 
 impl std::error::Error for ServeError {}
 
-/// Starts answering requests on a background thread. `handler` gets each
-/// request line (without its newline) and returns the response line.
-/// Requests are handled one at a time.
-pub fn serve(handler: impl Fn(&str) -> String + Send + 'static) -> Result<(), ServeError> {
+/// One connected client, as seen by a request handler.
+pub struct Connection<'a> {
+    pipe: &'a File,
+}
+
+impl Connection<'_> {
+    /// Sends one response line. A plain request sends exactly one; a
+    /// subscription keeps sending until this fails (the client went away).
+    pub fn send_line(&mut self, line: &str) -> io::Result<()> {
+        let mut writer = self.pipe;
+        writer.write_all(format!("{line}\n").as_bytes())?;
+        // Push it to the client now rather than when the buffer fills.
+        unsafe { FlushFileBuffers(raw(self.pipe)) }.map_err(io::Error::other)
+    }
+}
+
+/// Starts answering requests in the background. `handler` gets each request
+/// line (without its newline) and replies through the [`Connection`]. Every
+/// client gets its own thread, so a long-lived one (a subscription) doesn't
+/// hold up the others.
+pub fn serve(
+    handler: impl Fn(&str, &mut Connection) + Send + Sync + 'static,
+) -> Result<(), ServeError> {
     let name = pipe_name();
     let sddl = current_user_only_sddl().map_err(ServeError::Os)?;
     let first = create_pipe(&name, &sddl, true).map_err(|err| {
@@ -74,6 +94,7 @@ pub fn serve(handler: impl Fn(&str) -> String + Send + 'static) -> Result<(), Se
             ServeError::Os(err)
         }
     })?;
+    let handler = Arc::new(handler);
 
     std::thread::Builder::new()
         .name("rivewm-ipc".into())
@@ -91,11 +112,13 @@ pub fn serve(handler: impl Fn(&str) -> String + Send + 'static) -> Result<(), Se
                         Err(_) => std::thread::sleep(Duration::from_millis(100)),
                     }
                 };
-                serve_client(&listening, &handler);
-                unsafe {
-                    let _ = DisconnectNamedPipe(raw(&listening));
-                }
-                listening = next;
+                let client = std::mem::replace(&mut listening, next);
+                let handler = handler.clone();
+                let _ = std::thread::Builder::new()
+                    .name("rivewm-ipc-client".into())
+                    // Dropping `client` afterwards closes our end, which the
+                    // client reads as end-of-stream.
+                    .spawn(move || serve_client(&client, &*handler));
             }
         })
         .expect("failed to spawn IPC thread");
@@ -104,6 +127,17 @@ pub fn serve(handler: impl Fn(&str) -> String + Send + 'static) -> Result<(), Se
 
 /// Sends one request to the running rivewm and returns its response line.
 pub fn request(line: &str) -> io::Result<String> {
+    stream(line)?.next().unwrap_or_else(|| {
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "rivewm closed the connection without replying",
+        ))
+    })
+}
+
+/// Sends a request and returns every response line as it arrives, until
+/// rivewm closes the connection. Used for `subscribe`.
+pub fn stream(line: &str) -> io::Result<impl Iterator<Item = io::Result<String>>> {
     let name = pipe_name();
     let deadline = Instant::now() + Duration::from_secs(2);
     let pipe = loop {
@@ -125,9 +159,12 @@ pub fn request(line: &str) -> io::Result<String> {
         }
     };
     (&pipe).write_all(format!("{}\n", line.trim_end()).as_bytes())?;
-    let mut response = String::new();
-    BufReader::new(&pipe).read_line(&mut response)?;
-    Ok(response.trim_end().to_owned())
+    // A server that has hung up can also surface as "pipe not connected"
+    // rather than a clean EOF; either way the stream is over.
+    Ok(BufReader::new(pipe).lines().map_while(|line| match line {
+        Err(err) if err.raw_os_error() == Some(ERROR_PIPE_NOT_CONNECTED.0 as i32) => None,
+        other => Some(other),
+    }))
 }
 
 fn wait_for_client(pipe: &File) -> bool {
@@ -138,21 +175,13 @@ fn wait_for_client(pipe: &File) -> bool {
     }
 }
 
-fn serve_client(pipe: &File, handler: &impl Fn(&str) -> String) {
+fn serve_client(pipe: &File, handler: &impl Fn(&str, &mut Connection)) {
     let mut line = String::new();
     let mut reader = BufReader::new(pipe.take(MAX_REQUEST));
     if reader.read_line(&mut line).is_err() || line.is_empty() {
         return;
     }
-    let mut response = handler(line.trim_end());
-    response.push('\n');
-    let mut writer = pipe;
-    if writer.write_all(response.as_bytes()).is_ok() {
-        // Make sure the client has it all before we disconnect.
-        unsafe {
-            let _ = FlushFileBuffers(raw(pipe));
-        }
-    }
+    handler(line.trim_end(), &mut Connection { pipe });
 }
 
 fn create_pipe(name: &str, sddl: &HSTRING, first: bool) -> windows::core::Result<File> {

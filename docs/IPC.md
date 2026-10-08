@@ -52,6 +52,42 @@ And one query:
 |---------------|------------------------------------------------------|
 | `query state` | `state`: monitors → workspaces → layout and windows  |
 
+## Subscribing to events
+
+Send `subscribe` and keep the connection open. rivewm replies `{"ok": true}`,
+then writes one JSON line per event until you disconnect:
+
+```
+rivewm msg subscribe
+{"ok":true}
+{"event":"window_managed","window":3216412,"workspace":"1"}
+{"event":"layout_changed","workspace":"1"}
+{"event":"window_focused","window":3216412,"title":"Untitled - Notepad"}
+```
+
+| Event               | Fields                                   | When                                         |
+|---------------------|------------------------------------------|----------------------------------------------|
+| `workspace_created` | `workspace`, `monitor`                   | A workspace comes into existence             |
+| `workspace_removed` | `workspace`                              | An empty workspace is deleted (replaces `workspace_hidden` when it goes as it's hidden) |
+| `workspace_shown`   | `workspace`, `monitor`                   | It becomes the one shown on its monitor      |
+| `workspace_hidden`  | `workspace`                              | Another workspace replaced it on its monitor |
+| `workspace_focused` | `workspace` (or null)                    | Keyboard focus moved to another workspace    |
+| `window_managed`    | `window`, `workspace`                    | rivewm started managing a window             |
+| `window_unmanaged`  | `window`                                 | A window closed, minimized or was released   |
+| `window_moved`      | `window`, `from`, `to`                   | A window changed workspace                   |
+| `window_focused`    | `window` (or null), `title`              | Focus moved to another window                |
+| `title_changed`     | `window`, `title`                        | The *focused* window's title changed         |
+| `layout_changed`    | `workspace`                              | Any window's position in it changed          |
+| `config_reloaded`   |                                          | The config was reloaded                      |
+
+Events describe what changed, not the full picture: send `query state` (on
+a separate connection) when you need details. Several events can arrive for
+one action, e.g. switching workspace gives `workspace_hidden`,
+`workspace_shown`, `workspace_focused` and `window_focused`.
+
+A subscriber that stops reading and falls 256 events behind is disconnected,
+so rivewm never waits on a slow client.
+
 ## State shape
 
 ```json
