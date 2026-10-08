@@ -24,6 +24,8 @@ pub struct Config {
     /// Layout for newly created workspaces.
     pub default_layout: Layout,
     pub border: Border,
+    /// Resize neighbours while an edge is being dragged, not just on release.
+    pub live_resize: bool,
     pub bindings: Vec<(Hotkey, Command)>,
     pub rules: Vec<Rule>,
 }
@@ -123,6 +125,7 @@ pub fn load(path: &Path) -> Result<Config> {
 struct RawConfig {
     gaps: Option<RawGaps>,
     border: Option<RawBorder>,
+    resize: Option<RawResize>,
     floating: Option<RawFloating>,
     layout: Option<RawLayout>,
     keybindings: Option<BTreeMap<String, String>>,
@@ -134,6 +137,12 @@ struct RawConfig {
 struct RawGaps {
     inner: Option<i32>,
     outer: Option<i32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawResize {
+    live: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -208,6 +217,12 @@ pub fn parse(text: &str) -> Result<Config> {
         unfocused: color(user_border.unfocused, default_border.unfocused, "unfocused")?,
     };
 
+    let live_resize = user
+        .resize
+        .and_then(|r| r.live)
+        .or(defaults.resize.and_then(|r| r.live))
+        .unwrap_or(true);
+
     let floating_on_top = user
         .floating
         .and_then(|f| f.on_top)
@@ -241,6 +256,7 @@ pub fn parse(text: &str) -> Result<Config> {
         floating_on_top,
         default_layout,
         border,
+        live_resize,
         bindings,
         rules,
     })
@@ -337,6 +353,12 @@ mod tests {
             let err = format!("{:#}", parse(&text).unwrap_err());
             assert!(err.contains("focused") && err.contains(bad), "{err}");
         }
+    }
+
+    #[test]
+    fn live_resize_option() {
+        assert!(parse(DEFAULT_CONFIG).unwrap().live_resize);
+        assert!(!parse("[resize]\nlive = false").unwrap().live_resize);
     }
 
     #[test]

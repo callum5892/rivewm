@@ -23,8 +23,8 @@ pub use monitor::{MonitorInfo, monitors};
 pub use tray::{TrayAction, open_file};
 pub use window::{
     BorderColor, Skip, WindowInfo, cursor_position, enumerate_windows, focus_desktop, focus_window,
-    foreground_window, is_topmost, is_window_cloaked, query_window, raise_window, set_border_color,
-    set_frame, set_topmost, show_window, title,
+    foreground_window, frame, is_topmost, is_window_cloaked, query_window, raise_window,
+    set_border_color, set_frame, set_frame_redraw, set_topmost, show_window, title,
 };
 
 use windows::Win32::UI::HiDpi::{

@@ -11,10 +11,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetCursorPos,
     GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
     GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IsIconic,
-    IsWindow, IsWindowVisible, IsZoomed, SW_RESTORE, SW_SHOWNA, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
-    ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_THICKFRAME,
+    IsWindow, IsWindowVisible, IsZoomed, SET_WINDOW_POS_FLAGS, SW_RESTORE, SW_SHOWNA,
+    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_THICKFRAME,
 };
 use windows::core::BOOL;
 
@@ -198,6 +199,13 @@ pub fn cursor_position() -> Option<(i32, i32)> {
     Some((point.x, point.y))
 }
 
+/// A window's visible frame. Much cheaper than [`query_window`], so fine to
+/// call on every step of a drag.
+pub fn frame(id: WindowId) -> Option<Rect> {
+    let hwnd = hwnd(id);
+    extended_frame_bounds(hwnd).or_else(|| window_rect(hwnd))
+}
+
 /// A window's title. Much cheaper than [`query_window`].
 pub fn title(id: WindowId) -> String {
     window_title(hwnd(id))
@@ -222,6 +230,18 @@ pub fn focus_window(id: WindowId) -> bool {
 ///
 /// Uses `SWP_ASYNCWINDOWPOS` so a hung application can't block the WM.
 pub fn set_frame(id: WindowId, frame: Rect) -> windows::core::Result<()> {
+    position(id, frame, SET_WINDOW_POS_FLAGS(0))
+}
+
+/// Like [`set_frame`], but makes the window redraw itself from scratch
+/// rather than reusing its old contents. Slower to paint, but avoids
+/// smeared or misplaced fragments when it's resized many times in a row
+/// (e.g. following a dragged edge).
+pub fn set_frame_redraw(id: WindowId, frame: Rect) -> windows::core::Result<()> {
+    position(id, frame, SWP_NOCOPYBITS)
+}
+
+fn position(id: WindowId, frame: Rect, extra: SET_WINDOW_POS_FLAGS) -> windows::core::Result<()> {
     let hwnd = hwnd(id);
     unsafe {
         if IsZoomed(hwnd).as_bool() {
@@ -243,7 +263,7 @@ pub fn set_frame(id: WindowId, frame: Rect) -> windows::core::Result<()> {
             frame.y - top,
             frame.width + left + right,
             frame.height + top + bottom,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS | extra,
         )
     }
 }

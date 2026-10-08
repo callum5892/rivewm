@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use rivewm_core::tree::NodeKind;
 use rivewm_core::{
-    Axis, Command, Direction, Layout, MonitorSpec, NodeId, Rect, Tree, WindowEvent, WindowId,
+    Axis, Command, Direction, Layout, MonitorSpec, NodeId, Rect, SavedWeights, Tree, WindowEvent,
+    WindowId,
 };
 use rivewm_platform::{BorderColor, WindowInfo};
 use serde_json::{Value, json};
@@ -28,6 +29,20 @@ static MANAGED: Mutex<BTreeSet<WindowId>> = Mutex::new(BTreeSet::new());
 
 /// Windows we have cloaked, mirrored to disk for crash recovery.
 static CLOAKED: Mutex<BTreeSet<WindowId>> = Mutex::new(BTreeSet::new());
+
+/// Shortest time between live-resize steps (about 33 a second).
+const LIVE_RESIZE_INTERVAL: Duration = Duration::from_millis(30);
+
+/// Pixels a dragged window's size or edges may drift without counting as
+/// a resize, to absorb rounding in frame measurements.
+const DRAG_SLACK: i32 = 4;
+
+/// Whether a drag that started at `start` and is now at `frame` is a resize
+/// (rather than a move).
+fn was_resized(start: Rect, frame: Rect) -> bool {
+    (frame.width - start.width).abs() > DRAG_SLACK
+        || (frame.height - start.height).abs() > DRAG_SLACK
+}
 
 /// How long after a focus change to paint borders again (see `sync_border`).
 const BORDER_REASSERT_DELAYS: [u64; 3] = [80, 250, 800];
@@ -45,15 +60,32 @@ pub struct Wm {
     refused: RefCell<Vec<WindowId>>,
     /// Windows released for that reason, so they aren't managed again.
     unmovable: HashSet<WindowId>,
-    /// The window being dragged and its frame when the drag began, to tell
-    /// a move from a resize when it ends.
-    drag_start: Option<(WindowId, Rect)>,
+    /// The window being dragged with the mouse, if any.
+    drag: Option<Drag>,
     /// The window currently wearing the focused border colour.
     bordered: Option<WindowId>,
     /// The window that wore it before, which should now be unfocused-coloured.
     unbordered: Option<WindowId>,
     /// Re-paints still to come after the last focus change, soonest last.
     border_reasserts: Vec<Instant>,
+    /// When the next live-resize step is due, if one is pending.
+    live_resize_at: Option<Instant>,
+}
+
+/// A window being dragged with the mouse.
+struct Drag {
+    window: WindowId,
+    /// Its frame when the drag began: comparing with it tells a move from a
+    /// resize, and gives how far each edge has moved.
+    start: Rect,
+    /// Split sizes when the drag began, for tiled windows. Each step of a
+    /// live resize starts again from these, so nothing accumulates.
+    weights: Option<SavedWeights>,
+    /// Where live resizing last put each window in the workspace, so a step
+    /// only repositions windows whose rect actually changed.
+    placed: HashMap<WindowId, Rect>,
+    /// When the last live-resize step ran.
+    last_step: Option<Instant>,
 }
 
 /// Where a dragged tiled window was dropped.
@@ -81,10 +113,11 @@ impl Wm {
             fullscreen: BTreeSet::new(),
             refused: RefCell::new(Vec::new()),
             unmovable: HashSet::new(),
-            drag_start: None,
+            drag: None,
             bordered: None,
             unbordered: None,
             border_reasserts: Vec::new(),
+            live_resize_at: None,
         }
     }
 
@@ -308,14 +341,16 @@ impl Wm {
             }
             WindowEvent::Focused(id) => self.on_focused(id),
             WindowEvent::MoveSizeEnded(id) if self.tree.is_floating(id) => {
+                self.drag = None;
                 self.floating_moved(id);
             }
             WindowEvent::MoveSizeEnded(id) if self.tree.contains_window(id) => {
                 self.tiled_dropped(id);
             }
-            WindowEvent::MoveSizeEnded(_) => {}
-            WindowEvent::MoveSizeStarted(id) => {
-                self.drag_start = rivewm_platform::query_window(id).map(|w| (id, w.frame));
+            WindowEvent::MoveSizeEnded(_) => self.drag = None,
+            WindowEvent::MoveSizeStarted(id) => self.drag_started(id),
+            WindowEvent::LocationChanged(id) if self.drag.as_ref().is_some_and(|d| d.window == id) => {
+                self.request_live_resize();
             }
             WindowEvent::LocationChanged(_) => {}
         }
@@ -454,37 +489,24 @@ impl Wm {
             .into_iter()
             .find(|&(w, _)| w == id)
             .map(|(_, r)| r);
-        let frame = rivewm_platform::query_window(id).map(|w| w.frame);
+        let frame = rivewm_platform::frame(id);
         // Compare with the frame when the drag began rather than the tile:
         // apps with a minimum size bigger than their tile never match it.
-        let start = match self.drag_start.take() {
-            Some((w, start)) if w == id => Some(start),
-            _ => tile,
-        };
+        let drag = self.drag.take().filter(|d| d.window == id);
+        self.live_resize_at = None;
+        let start = drag.as_ref().map(|d| d.start).or(tile);
         let (Some(start), Some(frame)) = (start, frame) else {
             self.apply_all();
             return;
         };
 
-        // A few pixels of slack absorb rounding in the frame measurements.
-        const SLACK: i32 = 4;
-        let resized = (frame.width - start.width).abs() > SLACK
-            || (frame.height - start.height).abs() > SLACK;
-        if resized {
-            if self.tree.fullscreen_window(ws) != Some(id) {
-                // How far each edge moved outwards.
-                let edges = [
-                    (Direction::Left, start.x - frame.x),
-                    (Direction::Right, frame.right() - start.right()),
-                    (Direction::Up, start.y - frame.y),
-                    (Direction::Down, frame.bottom() - start.bottom()),
-                ];
-                for (side, grow) in edges {
-                    if grow.abs() > SLACK {
-                        self.tree.resize_edge(id, side, grow, self.config.gaps);
-                    }
-                }
+        if was_resized(start, frame) {
+            // Live resizing has been adjusting sizes along the way; finish
+            // from the same starting point so the result is exact.
+            if let Some(weights) = drag.as_ref().and_then(|d| d.weights.as_ref()) {
+                self.tree.restore_weights(weights);
             }
+            self.resize_edges(ws, id, start, frame);
         } else if let Some((x, y)) = rivewm_platform::cursor_position() {
             match self.drop_target(x, y) {
                 Some(Drop::Beside(target, side)) if self.tree.move_beside(id, target, side) => {
@@ -508,6 +530,103 @@ impl Wm {
         }
         // Covers both monitors if it crossed between them.
         self.apply_all();
+    }
+
+    /// A drag (move or resize) began on `id`. Windows runs its own loop
+    /// moving the window; we just note where it started.
+    fn drag_started(&mut self, id: WindowId) {
+        let Some(start) = rivewm_platform::frame(id) else {
+            return;
+        };
+        let tiled_ws = self.workspace_of(id).filter(|_| !self.tree.is_floating(id));
+        self.drag = Some(Drag {
+            window: id,
+            start,
+            weights: tiled_ws.map(|ws| self.tree.save_weights(ws)),
+            placed: tiled_ws
+                .map(|ws| {
+                    self.tree
+                        .arrange(ws, self.config.gaps)
+                        .into_iter()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            last_step: None,
+        });
+    }
+
+    /// The dragged window moved. Rather than respond to every one of these
+    /// (there can be well over a hundred a second), schedule a live-resize
+    /// step, at most one per [`LIVE_RESIZE_INTERVAL`], always using the
+    /// latest position. Slow-painting apps would otherwise fall behind.
+    fn request_live_resize(&mut self) {
+        if !self.config.live_resize || self.live_resize_at.is_some() {
+            return;
+        }
+        let Some(drag) = &self.drag else {
+            return;
+        };
+        let now = Instant::now();
+        let at = drag
+            .last_step
+            .map_or(now, |last| (last + LIVE_RESIZE_INTERVAL).max(now));
+        self.live_resize_at = Some(at);
+    }
+
+    /// One step of live resizing: keeps the dragged window's neighbours
+    /// following its edge. Each step starts again from the sizes saved when
+    /// the drag began and applies the total movement so far, then
+    /// repositions only the windows whose rect changed. The dragged window
+    /// itself is left alone: Windows is moving it.
+    fn live_resize_step(&mut self) {
+        let Some(drag) = self.drag.as_mut() else {
+            return;
+        };
+        drag.last_step = Some(Instant::now());
+        let (id, start, Some(weights)) = (drag.window, drag.start, drag.weights.clone()) else {
+            return;
+        };
+        let (Some(ws), Some(frame)) = (self.workspace_of(id), rivewm_platform::frame(id)) else {
+            return;
+        };
+        if !was_resized(start, frame) {
+            // A move; that's handled when it's dropped.
+            return;
+        }
+        self.tree.restore_weights(&weights);
+        self.resize_edges(ws, id, start, frame);
+
+        let rects = self.tree.arrange(ws, self.config.gaps);
+        let Some(drag) = self.drag.as_mut() else {
+            return;
+        };
+        for (window, rect) in rects {
+            if window == id || drag.placed.get(&window) == Some(&rect) {
+                continue;
+            }
+            drag.placed.insert(window, rect);
+            // Fresh redraws avoid smeared contents when resized repeatedly.
+            let _ = rivewm_platform::set_frame_redraw(window, rect);
+        }
+    }
+
+    /// Moves each edge of `id` that went from `start` to `frame` by the same
+    /// amount, resizing whatever lies across it.
+    fn resize_edges(&mut self, ws: NodeId, id: WindowId, start: Rect, frame: Rect) {
+        if self.tree.fullscreen_window(ws) == Some(id) {
+            return;
+        }
+        let edges = [
+            (Direction::Left, start.x - frame.x),
+            (Direction::Right, frame.right() - start.right()),
+            (Direction::Up, start.y - frame.y),
+            (Direction::Down, frame.bottom() - start.bottom()),
+        ];
+        for (side, grow) in edges {
+            if grow.abs() > DRAG_SLACK {
+                self.tree.resize_edge(id, side, grow, self.config.gaps);
+            }
+        }
     }
 
     /// What's under the cursor at `(x, y)` for a drop.
@@ -620,12 +739,20 @@ impl Wm {
 
     /// When [`Self::on_timer`] next needs to run, if at all.
     pub fn next_timer(&self) -> Option<Instant> {
-        self.border_reasserts.last().copied()
+        [self.border_reasserts.last().copied(), self.live_resize_at]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
-    /// Runs whatever timed work is due: currently re-painting borders.
+    /// Runs whatever timed work is due: a live-resize step, re-painting
+    /// borders.
     pub fn on_timer(&mut self) {
         let now = Instant::now();
+        if self.live_resize_at.is_some_and(|at| at <= now) {
+            self.live_resize_at = None;
+            self.live_resize_step();
+        }
         let mut due = false;
         while self.border_reasserts.last().is_some_and(|&at| at <= now) {
             self.border_reasserts.pop();

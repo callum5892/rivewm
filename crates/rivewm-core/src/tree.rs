@@ -53,6 +53,10 @@ impl Direction {
     }
 }
 
+/// Split sizes captured by [`Tree::save_weights`].
+#[derive(Debug, Clone)]
+pub struct SavedWeights(Vec<(NodeId, f64)>);
+
 /// A monitor as the OS reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorSpec {
@@ -1158,6 +1162,32 @@ impl Tree {
                     child = parent;
                 }
                 _ => return false,
+            }
+        }
+    }
+
+    /// Records the size of every split and window in a workspace, so a
+    /// series of resizes can each start from the same place (see
+    /// [`Self::restore_weights`]).
+    pub fn save_weights(&self, ws: NodeId) -> SavedWeights {
+        let mut saved = Vec::new();
+        let mut stack = vec![ws];
+        while let Some(node) = stack.pop() {
+            for &child in &self.node(node).children {
+                saved.push((child, self.node(child).weight));
+                stack.push(child);
+            }
+        }
+        SavedWeights(saved)
+    }
+
+    /// Puts sizes back as [`Self::save_weights`] found them. Nodes that have
+    /// since gone are skipped; arrange copes with weights that no longer
+    /// sum to one.
+    pub fn restore_weights(&mut self, saved: &SavedWeights) {
+        for &(node, weight) in &saved.0 {
+            if let Some(Some(n)) = self.nodes.get_mut(node.0 as usize) {
+                n.weight = weight;
             }
         }
     }
@@ -2470,6 +2500,26 @@ mod tests {
         assert!(tree.resize_edge(w(3), Direction::Up, 50, Gaps::default()));
         let rects = tree.arrange(ws, Gaps::default());
         assert_eq!((rects[1].1.height, rects[2].1.height), (200, 300));
+    }
+
+    #[test]
+    fn repeated_resizes_from_saved_weights_dont_accumulate() {
+        // What a live drag does: restore, then apply the total delta so far.
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2, 3]);
+        let saved = tree.save_weights(ws);
+        for grow in [40, 120, 80, 100] {
+            tree.restore_weights(&saved);
+            tree.resize_edge(w(1), Direction::Right, grow, Gaps::default());
+        }
+        assert_eq!(widths(&tree, ws, Gaps::default()), [433, 234, 333]);
+
+        // Dragging far past the minimum and back ends up exactly undone.
+        tree.restore_weights(&saved);
+        tree.resize_edge(w(1), Direction::Right, 5000, Gaps::default());
+        tree.restore_weights(&saved);
+        tree.resize_edge(w(1), Direction::Right, 0, Gaps::default());
+        assert_eq!(widths(&tree, ws, Gaps::default()), [333, 334, 333]);
     }
 
     #[test]
