@@ -1,18 +1,19 @@
 use std::ffi::c_void;
 
 use rivewm_core::{MonitorId, Rect, WindowId};
-use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetForegroundWindow,
-    GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SW_RESTORE, SW_SHOWNA,
-    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetForegroundWindow,
-    SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
+    EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetCursorPos,
+    GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IsIconic,
+    IsWindow, IsWindowVisible, IsZoomed, SW_RESTORE, SW_SHOWNA, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
+    ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_THICKFRAME,
 };
 use windows::core::BOOL;
 
@@ -112,6 +113,55 @@ pub fn focus_desktop() -> bool {
         let desktop = GetShellWindow();
         !desktop.is_invalid() && SetForegroundWindow(desktop).as_bool()
     }
+}
+
+/// Whether the window is "always on top", by its own choice or ours.
+pub fn is_topmost(id: WindowId) -> bool {
+    let ex_style = WINDOW_EX_STYLE(unsafe { GetWindowLongPtrW(hwnd(id), GWL_EXSTYLE) } as u32);
+    ex_style.contains(WS_EX_TOPMOST)
+}
+
+/// Puts a window in (or takes it out of) the always-on-top band, without
+/// moving, resizing or activating it.
+pub fn set_topmost(id: WindowId, topmost: bool) -> windows::core::Result<()> {
+    let after = if topmost {
+        HWND_TOPMOST
+    } else {
+        HWND_NOTOPMOST
+    };
+    unsafe {
+        SetWindowPos(
+            hwnd(id),
+            Some(after),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+        )
+    }
+}
+
+/// Brings a window to the front of its band without activating it.
+pub fn raise_window(id: WindowId) -> windows::core::Result<()> {
+    unsafe {
+        SetWindowPos(
+            hwnd(id),
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+        )
+    }
+}
+
+/// Where the mouse cursor is, in physical screen pixels.
+pub fn cursor_position() -> Option<(i32, i32)> {
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&mut point) }.ok()?;
+    Some((point.x, point.y))
 }
 
 /// A window's title. Much cheaper than [`query_window`].

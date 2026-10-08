@@ -18,6 +18,7 @@ use crate::{Axis, Direction, WindowId};
 /// | `split vertical`                  | `Split(Vertical)`             |
 /// | `toggle-split`                    | `ToggleSplit`                 |
 /// | `toggle-floating`                 | `ToggleFloating`              |
+/// | `toggle-fullscreen`               | `ToggleFullscreen`            |
 /// | `resize width +5`                 | grow width by 5% of container |
 /// | `resize height -5`                | shrink height by 5%           |
 /// | `retile`, `reload-config`, `quit` | as named                      |
@@ -40,6 +41,9 @@ pub enum Command {
     ToggleSplit,
     /// Switch the focused window between tiled and floating.
     ToggleFloating,
+    /// Make the focused window cover its whole monitor, or return it to
+    /// normal.
+    ToggleFullscreen,
     /// Grow (positive) or shrink the focused window by a fraction of its
     /// container.
     Resize {
@@ -124,6 +128,7 @@ impl FromStr for Command {
                 match simple {
                     "toggle-split" => Command::ToggleSplit,
                     "toggle-floating" => Command::ToggleFloating,
+                    "toggle-fullscreen" => Command::ToggleFullscreen,
                     "retile" => Command::Retile,
                     "reload-config" => Command::ReloadConfig,
                     "quit" => Command::Quit,
@@ -164,6 +169,7 @@ mod tests {
         assert_eq!(parse("split vertical"), Command::Split(Axis::Vertical));
         assert_eq!(parse("toggle-split"), Command::ToggleSplit);
         assert_eq!(parse("toggle-floating"), Command::ToggleFloating);
+        assert_eq!(parse("toggle-fullscreen"), Command::ToggleFullscreen);
         assert_eq!(
             parse("resize width +5"),
             Command::Resize {

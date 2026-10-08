@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
 use rivewm_core::tree::NodeKind;
-use rivewm_core::{Axis, Command, Layout, NodeId, Rect, Tree, WindowEvent, WindowId};
+use rivewm_core::{Axis, Command, Direction, Layout, NodeId, Rect, Tree, WindowEvent, WindowId};
 use rivewm_platform::WindowInfo;
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
@@ -25,9 +25,22 @@ static MANAGED: Mutex<BTreeSet<WindowId>> = Mutex::new(BTreeSet::new());
 /// Windows we have cloaked, mirrored to disk for crash recovery.
 static CLOAKED: Mutex<BTreeSet<WindowId>> = Mutex::new(BTreeSet::new());
 
+/// Floating windows we made always-on-top, so we can undo exactly those.
+static MADE_TOPMOST: Mutex<BTreeSet<WindowId>> = Mutex::new(BTreeSet::new());
+
 pub struct Wm {
     tree: Tree,
     config: Config,
+    /// Fullscreen windows as of the last time we positioned them.
+    fullscreen: BTreeSet<WindowId>,
+}
+
+/// Where a dragged tiled window was dropped.
+enum Drop {
+    /// Beside this tile, on this side.
+    Beside(WindowId, Direction),
+    /// Onto a monitor showing a workspace with no tiles.
+    EmptyWorkspace(NodeId),
 }
 
 impl Wm {
@@ -35,17 +48,25 @@ impl Wm {
     pub fn new(config: Config) -> Self {
         let mut tree = Tree::new();
         for (i, m) in rivewm_platform::monitors().into_iter().enumerate() {
-            let monitor = tree.add_monitor(m.id, m.work_area);
+            let monitor = tree.add_monitor(m.id, m.bounds, m.work_area);
             tree.add_workspace(monitor, (i + 1).to_string(), Layout::Manual);
             info!(device = %m.device, work_area = %m.work_area, "added monitor");
         }
-        Self { tree, config }
+        Self {
+            tree,
+            config,
+            fullscreen: BTreeSet::new(),
+        }
     }
 
-    /// Swaps in a reloaded config. New gaps apply immediately; rules apply
-    /// to windows opened from now on.
+    /// Swaps in a reloaded config. New gaps and the floating on-top setting
+    /// apply immediately; rules apply to windows opened from now on.
     pub fn set_config(&mut self, config: Config) {
         self.config = config;
+        let managed: Vec<_> = lock(&MANAGED).iter().copied().collect();
+        for id in managed {
+            self.sync_topmost(id);
+        }
         self.apply_all();
     }
 
@@ -69,6 +90,12 @@ impl Wm {
 
     /// Runs a user command. Returns `Break` when the WM should exit.
     pub fn execute(&mut self, command: Command) -> ControlFlow<()> {
+        let flow = self.run(command);
+        self.sync_fullscreen();
+        flow
+    }
+
+    fn run(&mut self, command: Command) -> ControlFlow<()> {
         debug!(?command);
         let focused = self.tree.focused_window();
         match command {
@@ -127,7 +154,14 @@ impl Wm {
                     if self.tree.is_floating(id) {
                         self.place_floating(id);
                     }
+                    self.sync_topmost(id);
                     self.apply(ws);
+                }
+            }
+            Command::ToggleFullscreen => {
+                // Positioning happens in `sync_fullscreen`.
+                if let Some(id) = focused {
+                    self.tree.toggle_fullscreen(id);
                 }
             }
             Command::Resize { axis, delta } => {
@@ -147,6 +181,11 @@ impl Wm {
     }
 
     pub fn handle(&mut self, event: WindowEvent) {
+        self.on_event(event);
+        self.sync_fullscreen();
+    }
+
+    fn on_event(&mut self, event: WindowEvent) {
         debug!(?event);
         match event {
             WindowEvent::Shown(id)
@@ -172,12 +211,10 @@ impl Wm {
             WindowEvent::MoveSizeEnded(id) if self.tree.is_floating(id) => {
                 self.floating_moved(id);
             }
-            WindowEvent::MoveSizeEnded(id) => {
-                // The user dragged or resized a tiled window: snap it back.
-                if let Some(ws) = self.workspace_of(id) {
-                    self.apply(ws);
-                }
+            WindowEvent::MoveSizeEnded(id) if self.tree.contains_window(id) => {
+                self.tiled_dropped(id);
             }
+            WindowEvent::MoveSizeEnded(_) => {}
             WindowEvent::MoveSizeStarted(_) | WindowEvent::LocationChanged(_) => {}
         }
     }
@@ -280,12 +317,135 @@ impl Wm {
         self.tree.set_float_rect(id, info.frame);
     }
 
-    /// Puts a floating window where the tree says it floats.
+    /// Puts a floating window where the tree says it floats (the whole
+    /// monitor, if it's fullscreen).
     fn place_floating(&self, id: WindowId) {
-        if let Some(rect) = self.tree.float_rect(id)
+        let rect = self.workspace_of(id).and_then(|ws| {
+            self.tree
+                .floating_windows(ws)
+                .into_iter()
+                .find(|&(w, _)| w == id)
+        });
+        if let Some((_, rect)) = rect
             && let Err(err) = rivewm_platform::set_frame(id, rect)
         {
             warn!(window = format_args!("{:#x}", id.0), %err, "failed to position window");
+        }
+    }
+
+    /// The user let go of a tiled window after dragging it. Moving it puts it
+    /// beside whichever tile the cursor is over, on the side the cursor is
+    /// nearest (or onto an empty monitor). Anything else, including
+    /// dropping it back on its own tile or resizing it by an edge, snaps it
+    /// back into place.
+    fn tiled_dropped(&mut self, id: WindowId) {
+        let tile = self.workspace_of(id).and_then(|ws| {
+            let rects = self.tree.arrange(ws, self.config.gaps);
+            rects.into_iter().find(|&(w, _)| w == id).map(|(_, r)| r)
+        });
+        let frame = rivewm_platform::query_window(id).map(|w| w.frame);
+        // Mouse resizing isn't supported yet; a few pixels of slack allow
+        // for rounding.
+        let resized = match (tile, frame) {
+            (Some(tile), Some(frame)) => {
+                (frame.width - tile.width).abs() > 4 || (frame.height - tile.height).abs() > 4
+            }
+            _ => true,
+        };
+        if !resized && let Some((x, y)) = rivewm_platform::cursor_position() {
+            match self.drop_target(x, y) {
+                Some(Drop::Beside(target, side)) if self.tree.move_beside(id, target, side) => {
+                    info!(
+                        window = format_args!("{:#x}", id.0),
+                        ?side,
+                        "dropped beside window"
+                    );
+                }
+                Some(Drop::EmptyWorkspace(ws))
+                    if self.tree.move_window_to_workspace(id, ws).is_some() =>
+                {
+                    self.tree.focus_window(id);
+                    info!(
+                        window = format_args!("{:#x}", id.0),
+                        "dropped on empty monitor"
+                    );
+                }
+                _ => {}
+            }
+        }
+        // Covers both monitors if it crossed between them.
+        self.apply_all();
+    }
+
+    /// What's under the cursor at `(x, y)` for a drop.
+    fn drop_target(&self, x: i32, y: i32) -> Option<Drop> {
+        let ws = self.tree.monitors().find_map(|m| {
+            self.tree
+                .monitor_work_area(m)
+                .contains_point(x, y)
+                .then(|| self.tree.active_workspace(m))
+                .flatten()
+        })?;
+        let tiles = self.tree.arrange(ws, self.config.gaps);
+        if tiles.is_empty() {
+            return Some(Drop::EmptyWorkspace(ws));
+        }
+        // Over a gap between tiles: no target.
+        let &(target, r) = tiles.iter().find(|(_, r)| r.contains_point(x, y))?;
+        let (cx, cy) = r.center();
+        let dx = (x - cx) as f64 / r.width.max(1) as f64;
+        let dy = (y - cy) as f64 / r.height.max(1) as f64;
+        let side = if dx.abs() > dy.abs() {
+            if dx < 0.0 {
+                Direction::Left
+            } else {
+                Direction::Right
+            }
+        } else if dy < 0.0 {
+            Direction::Up
+        } else {
+            Direction::Down
+        };
+        Some(Drop::Beside(target, side))
+    }
+
+    /// Positions windows after fullscreen started or ended, however that
+    /// happened: the command, or implicitly when focus moved on or the
+    /// window closed.
+    fn sync_fullscreen(&mut self) {
+        let now: BTreeSet<WindowId> = self
+            .tree
+            .workspaces()
+            .filter_map(|ws| self.tree.fullscreen_window(ws))
+            .collect();
+        if now == self.fullscreen {
+            return;
+        }
+        let changed: Vec<_> = now
+            .symmetric_difference(&self.fullscreen)
+            .copied()
+            .collect();
+        self.fullscreen = now;
+        self.apply_all();
+        for id in changed {
+            if self.tree.is_floating(id) {
+                self.place_floating(id);
+            }
+        }
+    }
+
+    /// Makes a window always-on-top if it's floating and the config asks for
+    /// that, and undoes it otherwise. Windows that were already on top by
+    /// their own choice (e.g. picture-in-picture) are left alone.
+    fn sync_topmost(&self, id: WindowId) {
+        let want = self.config.floating_on_top && self.tree.is_floating(id);
+        let mut ours = lock(&MADE_TOPMOST);
+        if want && !ours.contains(&id) && !rivewm_platform::is_topmost(id) {
+            if rivewm_platform::set_topmost(id, true).is_ok() {
+                ours.insert(id);
+            }
+        } else if !want && ours.remove(&id) {
+            let _ = rivewm_platform::set_topmost(id, false);
         }
     }
 
@@ -504,6 +664,7 @@ impl Wm {
             // A rule sent it to a workspace that isn't shown.
             cloak(info.id, true);
         }
+        self.sync_topmost(info.id);
         Some(ws)
     }
 
@@ -512,6 +673,8 @@ impl Wm {
             return;
         };
         lock(&MANAGED).remove(&id);
+        // No longer in the tree, so this undoes any always-on-top of ours.
+        self.sync_topmost(id);
         info!(window = format_args!("{:#x}", id.0), "unmanaged");
         if self.tree.is_workspace_active(ws) {
             self.apply(ws);
@@ -541,6 +704,9 @@ impl Wm {
                 // Typically an elevated window we aren't allowed to move.
                 warn!(window = format_args!("{:#x}", id.0), %err, "failed to position window");
             }
+        }
+        if let Some(id) = self.tree.fullscreen_window(ws) {
+            let _ = rivewm_platform::raise_window(id);
         }
     }
 }
@@ -620,13 +786,18 @@ pub fn recover_cloaked() {
     let _ = std::fs::remove_file(path);
 }
 
-/// Makes every managed window visible again: uncloaked and shown. Safe to
-/// call from a panic hook or signal handler.
+/// Makes every managed window visible again (uncloaked and shown) and drops
+/// any always-on-top we added. Safe to call from a panic hook or signal
+/// handler.
 pub fn restore_all() {
     for &id in lock(&MANAGED).iter() {
         let _ = rivewm_platform::set_cloaked(id, false);
         rivewm_platform::show_window(id);
     }
+    for &id in lock(&MADE_TOPMOST).iter() {
+        let _ = rivewm_platform::set_topmost(id, false);
+    }
+    lock(&MADE_TOPMOST).clear();
     lock(&CLOAKED).clear();
     let _ = std::fs::remove_file(cloaked_record());
 }

@@ -19,6 +19,8 @@ pub const DEFAULT_CONFIG: &str = include_str!("default_config.toml");
 #[derive(Debug)]
 pub struct Config {
     pub gaps: Gaps,
+    /// Keep floating windows always on top.
+    pub floating_on_top: bool,
     pub bindings: Vec<(Hotkey, Command)>,
     pub rules: Vec<Rule>,
 }
@@ -91,6 +93,7 @@ pub fn load(path: &Path) -> Result<Config> {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     gaps: Option<RawGaps>,
+    floating: Option<RawFloating>,
     keybindings: Option<BTreeMap<String, String>>,
     rules: Option<Vec<RawRule>>,
 }
@@ -100,6 +103,12 @@ struct RawConfig {
 struct RawGaps {
     inner: Option<i32>,
     outer: Option<i32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFloating {
+    on_top: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -130,6 +139,12 @@ pub fn parse(text: &str) -> Result<Config> {
         bail!("gaps can't be negative");
     }
 
+    let floating_on_top = user
+        .floating
+        .and_then(|f| f.on_top)
+        .or(defaults.floating.and_then(|f| f.on_top))
+        .unwrap_or(false);
+
     let keybindings = user
         .keybindings
         .or(defaults.keybindings)
@@ -154,6 +169,7 @@ pub fn parse(text: &str) -> Result<Config> {
 
     Ok(Config {
         gaps,
+        floating_on_top,
         bindings,
         rules,
     })
@@ -206,20 +222,27 @@ mod tests {
         let config = parse(DEFAULT_CONFIG).unwrap();
         assert_eq!(config.gaps, Gaps { inner: 8, outer: 8 });
         assert!(config.rules.is_empty());
+        assert!(!config.floating_on_top);
         let focus_left = "alt+h".parse::<Hotkey>().unwrap();
         assert!(
             config
                 .bindings
                 .contains(&(focus_left, Command::Focus(Direction::Left)))
         );
-        assert_eq!(config.bindings.len(), 47);
+        assert_eq!(config.bindings.len(), 48);
     }
 
     #[test]
     fn missing_sections_fall_back_to_defaults() {
         let config = parse("[gaps]\ninner = 2\n").unwrap();
         assert_eq!(config.gaps, Gaps { inner: 2, outer: 8 });
-        assert_eq!(config.bindings.len(), 47);
+        assert_eq!(config.bindings.len(), 48);
+    }
+
+    #[test]
+    fn floating_on_top_option() {
+        assert!(parse("[floating]\non_top = true").unwrap().floating_on_top);
+        assert!(!parse("[floating]\n").unwrap().floating_on_top);
     }
 
     #[test]

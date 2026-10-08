@@ -75,6 +75,9 @@ pub enum NodeKind {
     Root,
     Monitor {
         id: MonitorId,
+        /// The whole monitor; fullscreen windows cover this.
+        bounds: Rect,
+        /// The monitor minus the taskbar; tiles fill this.
         work_area: Rect,
         active_workspace: Option<NodeId>,
     },
@@ -88,6 +91,8 @@ pub enum NodeKind {
         /// tree: their parent is this workspace, but they aren't among its
         /// `children`.
         floating: Vec<NodeId>,
+        /// A window (tiled or floating) covering the whole monitor.
+        fullscreen: Option<NodeId>,
     },
     Split {
         axis: Axis,
@@ -179,14 +184,51 @@ impl Tree {
     }
 
     /// Floating windows in a workspace with their positions, oldest first.
+    /// A fullscreen one is given the monitor's bounds.
     pub fn floating_windows(&self, ws: NodeId) -> Vec<(WindowId, Rect)> {
+        let fullscreen = self.fullscreen_node(ws);
         self.floating_nodes(ws)
             .iter()
             .filter_map(|&n| match self.node(n).kind {
+                _ if fullscreen == Some(n) => {
+                    Some((self.window_id(n), self.monitor_bounds(self.monitor_of(ws))))
+                }
                 NodeKind::Window { id, float_rect, .. } => Some((id, float_rect?)),
                 _ => None,
             })
             .collect()
+    }
+
+    /// The window covering the whole monitor in `ws`, if any.
+    pub fn fullscreen_window(&self, ws: NodeId) -> Option<WindowId> {
+        self.fullscreen_node(ws).map(|n| self.window_id(n))
+    }
+
+    fn fullscreen_node(&self, ws: NodeId) -> Option<NodeId> {
+        match self.node(ws).kind {
+            NodeKind::Workspace { fullscreen, .. } => fullscreen,
+            _ => None,
+        }
+    }
+
+    fn set_fullscreen_node(&mut self, ws: NodeId, node: Option<NodeId>) {
+        if let NodeKind::Workspace { fullscreen, .. } = &mut self.node_mut(ws).kind {
+            *fullscreen = node;
+        }
+    }
+
+    /// Makes `window` cover its whole monitor, or returns it to normal. It
+    /// gets focus. Focusing another window in the workspace, or moving,
+    /// floating or removing this one, also ends fullscreen.
+    pub fn toggle_fullscreen(&mut self, window: WindowId) -> bool {
+        let Some(node) = self.window_node(window) else {
+            return false;
+        };
+        let ws = self.workspace_of(node).expect("window outside a workspace");
+        let new = (self.fullscreen_node(ws) != Some(node)).then_some(node);
+        self.set_workspace_focus(ws, Some(node));
+        self.set_fullscreen_node(ws, new);
+        true
     }
 
     pub fn is_floating(&self, window: WindowId) -> bool {
@@ -317,9 +359,10 @@ impl Tree {
 
     // ---- Monitors & workspaces --------------------------------------------
 
-    pub fn add_monitor(&mut self, id: MonitorId, work_area: Rect) -> NodeId {
+    pub fn add_monitor(&mut self, id: MonitorId, bounds: Rect, work_area: Rect) -> NodeId {
         let node = self.alloc(NodeKind::Monitor {
             id,
+            bounds,
             work_area,
             active_workspace: None,
         });
@@ -341,6 +384,7 @@ impl Tree {
             axis: Axis::Horizontal,
             focus: None,
             floating: Vec::new(),
+            fullscreen: None,
         });
         // Keep workspaces ordered by name (numerically where possible) so a
         // status bar can list them as-is.
@@ -514,6 +558,9 @@ impl Tree {
     /// focus to its nearest sibling. Returns the workspace it left.
     fn unlink_window(&mut self, node: NodeId) -> NodeId {
         let ws = self.workspace_of(node).expect("window outside a workspace");
+        if self.fullscreen_node(ws) == Some(node) {
+            self.set_fullscreen_node(ws, None);
+        }
         if self.node_is_floating(node) {
             self.floating_nodes_mut(ws).retain(|&n| n != node);
             self.node_mut(node).parent = None;
@@ -586,6 +633,39 @@ impl Tree {
             self.set_workspace_focus(target, Some(node));
         }
         Some(source)
+    }
+
+    /// Moves a tiled `window` so it sits on `side` of the tiled `target`,
+    /// which may be in another workspace or on another monitor. If target's
+    /// container runs the other way, target is wrapped in a new split so the
+    /// two can sit side by side. The window keeps focus. Returns `false` if
+    /// there's nothing to do.
+    pub fn move_beside(&mut self, window: WindowId, target: WindowId, side: Direction) -> bool {
+        let (Some(node), Some(target)) = (self.window_node(window), self.window_node(target))
+        else {
+            return false;
+        };
+        if node == target || self.node_is_floating(node) || self.node_is_floating(target) {
+            return false;
+        }
+        let axis = side.axis();
+        let after = matches!(side, Direction::Right | Direction::Down);
+
+        // Unlink first: it may restructure the tree around the old spot,
+        // which can include target's container.
+        self.unlink_window(node);
+        let (parent, idx) = self.index_in_parent(target);
+        if self.container_axis(parent) == Some(axis) {
+            self.insert_child(parent, if after { idx + 1 } else { idx }, node);
+        } else {
+            // `split` re-orients a lone child's container instead of
+            // wrapping it, which works just as well here.
+            self.split(self.window_id(target), axis);
+            let (parent, idx) = self.index_in_parent(target);
+            self.insert_child(parent, if after { idx + 1 } else { idx }, node);
+        }
+        self.focus_window(window);
+        true
     }
 
     /// Moves `window` one step in `direction`, i3 style:
@@ -749,9 +829,16 @@ impl Tree {
         true
     }
 
+    /// Also ends fullscreen if focus moves to a different window.
     fn set_workspace_focus(&mut self, ws: NodeId, node: Option<NodeId>) {
-        if let NodeKind::Workspace { focus, .. } = &mut self.node_mut(ws).kind {
+        if let NodeKind::Workspace {
+            focus, fullscreen, ..
+        } = &mut self.node_mut(ws).kind
+        {
             *focus = node;
+            if fullscreen.is_some() && *fullscreen != node {
+                *fullscreen = None;
+            }
         }
     }
 
@@ -843,14 +930,28 @@ impl Tree {
 
     // ---- Geometry ----------------------------------------------------------
 
-    /// Computes where every window in a workspace should go.
+    /// Computes where every tiled window in a workspace should go. A
+    /// fullscreen one gets the monitor's bounds; the rest keep their tiles.
     pub fn arrange(&self, ws: NodeId, gaps: Gaps) -> Vec<(WindowId, Rect)> {
-        let NodeKind::Monitor { work_area, .. } = self.node(self.monitor_of(ws)).kind else {
-            unreachable!("workspace parent is not a monitor");
-        };
+        let monitor = self.monitor_of(ws);
         let mut out = Vec::new();
-        self.arrange_node(ws, work_area.inset(gaps.outer), gaps.inner, &mut out);
+        let area = self.monitor_work_area(monitor).inset(gaps.outer);
+        self.arrange_node(ws, area, gaps.inner, &mut out);
+        if let Some(fullscreen) = self.fullscreen_window(ws) {
+            for (id, rect) in &mut out {
+                if *id == fullscreen {
+                    *rect = self.monitor_bounds(monitor);
+                }
+            }
+        }
         out
+    }
+
+    fn monitor_bounds(&self, monitor: NodeId) -> Rect {
+        match self.node(monitor).kind {
+            NodeKind::Monitor { bounds, .. } => bounds,
+            _ => panic!("{monitor:?} is not a monitor"),
+        }
     }
 
     fn arrange_node(&self, node: NodeId, rect: Rect, inner: i32, out: &mut Vec<(WindowId, Rect)>) {
@@ -966,7 +1067,7 @@ impl Tree {
         }
     }
 
-    fn monitor_work_area(&self, monitor: NodeId) -> Rect {
+    pub fn monitor_work_area(&self, monitor: NodeId) -> Rect {
         match self.node(monitor).kind {
             NodeKind::Monitor { work_area, .. } => work_area,
             _ => panic!("{monitor:?} is not a monitor"),
@@ -1190,7 +1291,12 @@ mod tests {
     /// A tree with one 1000x500 monitor and one manual workspace.
     fn setup() -> (Tree, NodeId) {
         let mut tree = Tree::new();
-        let mon = tree.add_monitor(MonitorId(1), Rect::new(0, 0, 1000, 500));
+        // 40px taskbar along the bottom.
+        let mon = tree.add_monitor(
+            MonitorId(1),
+            Rect::new(0, 0, 1000, 540),
+            Rect::new(0, 0, 1000, 500),
+        );
         let ws = tree.add_workspace(mon, "1", Layout::Manual);
         (tree, ws)
     }
@@ -1388,8 +1494,16 @@ mod tests {
     /// mismatched desk setup.
     fn setup_dual() -> (Tree, NodeId, NodeId) {
         let mut tree = Tree::new();
-        let left = tree.add_monitor(MonitorId(1), Rect::new(0, 0, 1000, 500));
-        let right = tree.add_monitor(MonitorId(2), Rect::new(1000, -30, 800, 480));
+        let left = tree.add_monitor(
+            MonitorId(1),
+            Rect::new(0, 0, 1000, 540),
+            Rect::new(0, 0, 1000, 500),
+        );
+        let right = tree.add_monitor(
+            MonitorId(2),
+            Rect::new(1000, -30, 800, 520),
+            Rect::new(1000, -30, 800, 480),
+        );
         let ws1 = tree.add_workspace(left, "1", Layout::Manual);
         let ws2 = tree.add_workspace(right, "2", Layout::Manual);
         (tree, ws1, ws2)
@@ -1751,6 +1865,113 @@ mod tests {
         // x clamped so it fits the narrower monitor; y kept relative.
         assert_eq!(tree.float_rect(w(2)), Some(Rect::new(1600, 70, 200, 100)));
         assert!(tree.is_floating(w(2)));
+    }
+
+    #[test]
+    fn fullscreen_covers_monitor_and_toggles_off() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        assert!(tree.toggle_fullscreen(w(1)));
+        assert_eq!(tree.fullscreen_window(ws), Some(w(1)));
+        assert_eq!(tree.focused_window(), Some(w(1)));
+        let rects = tree.arrange(ws, Gaps { inner: 8, outer: 8 });
+        // Whole monitor, taskbar included, no gaps; 2 keeps its tile.
+        assert_eq!(rects[0], (w(1), Rect::new(0, 0, 1000, 540)));
+        assert_eq!(rects[1].1.width, 488);
+
+        tree.toggle_fullscreen(w(1));
+        assert_eq!(tree.fullscreen_window(ws), None);
+        assert_eq!(tree.arrange(ws, Gaps::default())[0].1.width, 500);
+    }
+
+    #[test]
+    fn fullscreen_ends_when_focus_or_window_moves_on() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        tree.toggle_fullscreen(w(1));
+        tree.focus_window(w(2));
+        assert_eq!(tree.fullscreen_window(ws), None);
+
+        tree.toggle_fullscreen(w(2));
+        tree.remove_window(w(2));
+        assert_eq!(tree.fullscreen_window(ws), None);
+
+        open(&mut tree, ws, &[3]);
+        tree.toggle_fullscreen(w(3));
+        tree.toggle_floating(w(3));
+        assert_eq!(tree.fullscreen_window(ws), None);
+    }
+
+    #[test]
+    fn floating_window_can_be_fullscreen() {
+        let (mut tree, ws) = setup();
+        tree.insert_floating(ws, w(1), Rect::new(10, 10, 100, 100));
+        tree.toggle_fullscreen(w(1));
+        assert_eq!(
+            tree.floating_windows(ws),
+            [(w(1), Rect::new(0, 0, 1000, 540))]
+        );
+        tree.toggle_fullscreen(w(1));
+        assert_eq!(
+            tree.floating_windows(ws),
+            [(w(1), Rect::new(10, 10, 100, 100))]
+        );
+    }
+
+    #[test]
+    fn move_beside_along_container_axis() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2, 3]);
+        assert!(tree.move_beside(w(1), w(3), Direction::Right));
+        assert_eq!(tree.debug_layout(ws), "H[2 3 1]");
+        assert!(tree.move_beside(w(1), w(2), Direction::Left));
+        assert_eq!(tree.debug_layout(ws), "H[1 2 3]");
+        assert_eq!(tree.focused_window(), Some(w(1)));
+        weights_sum_to_one(&tree, ws);
+    }
+
+    #[test]
+    fn move_beside_across_axis_splits_target() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2, 3]);
+        assert!(tree.move_beside(w(3), w(1), Direction::Down));
+        assert_eq!(tree.debug_layout(ws), "H[V[1 3] 2]");
+        assert!(tree.move_beside(w(2), w(3), Direction::Up));
+        // H[V[1 3]] collapses: the workspace takes the V orientation.
+        assert_eq!(tree.debug_layout(ws), "V[1 2 3]");
+        weights_sum_to_one(&tree, ws);
+    }
+
+    #[test]
+    fn move_beside_lone_window_reorients() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        assert!(tree.move_beside(w(2), w(1), Direction::Up));
+        assert_eq!(tree.debug_layout(ws), "V[2 1]");
+    }
+
+    #[test]
+    fn move_beside_across_monitors() {
+        let (mut tree, ws1, ws2) = setup_dual();
+        open(&mut tree, ws1, &[1, 2]);
+        tree.focus_workspace(ws2);
+        open(&mut tree, ws2, &[3]);
+        assert!(tree.move_beside(w(2), w(3), Direction::Left));
+        assert_eq!(tree.debug_layout(ws1), "H[1]");
+        assert_eq!(tree.debug_layout(ws2), "H[2 3]");
+        assert_eq!(tree.focused_workspace(), Some(ws2));
+        assert_eq!(tree.workspace_focused_window(ws1), Some(w(1)));
+    }
+
+    #[test]
+    fn move_beside_refuses_self_and_floats() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        tree.insert_floating(ws, w(3), Rect::new(0, 0, 10, 10));
+        assert!(!tree.move_beside(w(1), w(1), Direction::Left));
+        assert!(!tree.move_beside(w(3), w(1), Direction::Left));
+        assert!(!tree.move_beside(w(1), w(3), Direction::Left));
+        assert_eq!(tree.debug_layout(ws), "H[1 2] F[3]");
     }
 
     #[test]

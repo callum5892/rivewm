@@ -9,6 +9,12 @@ inner = 8
 # Space between windows and the edge of the screen (not counting the taskbar).
 outer = 8
 
+[floating]
+# Keep floating windows (dialogs, picture-in-picture, anything toggled with
+# toggle-floating) above tiled windows. Uses Windows' "always on top", so
+# they also stay above other apps' windows while visible.
+on_top = false
+
 # Hotkey = command.
 #
 # Modifiers: alt, ctrl, shift, win
@@ -19,7 +25,8 @@ outer = 8
 #   focus <left|right|up|down>      move <left|right|up|down>
 #   workspace <name>                move-to-workspace <name>
 #   split <horizontal|vertical>     toggle-split
-#   toggle-floating                 resize <width|height> <+N|-N>  (percent)
+#   toggle-floating                 toggle-fullscreen
+#   resize <width|height> <+N|-N>   (percent of the containing split)
 #   retile                          reload-config
 #   quit
 #
@@ -47,6 +54,7 @@ outer = 8
 
 "alt+v" = "toggle-split"
 "alt+shift+space" = "toggle-floating"
+"alt+f" = "toggle-fullscreen"
 
 "alt+ctrl+l" = "resize width +5"
 "alt+ctrl+h" = "resize width -5"
