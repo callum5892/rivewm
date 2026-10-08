@@ -4,18 +4,22 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use rivewm_core::{WindowEvent, WindowId};
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CHILDID_SELF, DispatchMessageW, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
-    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW,
-    EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GetMessageW,
-    MSG, OBJID_WINDOW, PostThreadMessageW, TranslateMessage, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_HOTKEY, WM_QUIT,
+    CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
+    EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND,
+    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND,
+    EVENT_SYSTEM_MOVESIZESTART, GetMessageW, MSG, OBJID_WINDOW, PostThreadMessageW, RegisterClassW,
+    SPI_SETWORKAREA, TranslateMessage, WINDOW_STYLE, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_DISPLAYCHANGE, WM_HOTKEY, WM_QUIT, WM_SETTINGCHANGE,
+    WNDCLASSW, WS_EX_TOOLWINDOW,
 };
+use windows::core::w;
 
 use crate::Hotkey;
 
@@ -27,6 +31,9 @@ pub enum Event {
     /// most recently passed to [`EventThread::spawn`] or
     /// [`EventThread::set_hotkeys`].
     Hotkey(usize),
+    /// Monitors were connected, disconnected, rearranged or resized, or the
+    /// taskbar changed the work area. Windows sends these in bursts.
+    DisplayChanged,
 }
 
 thread_local! {
@@ -168,6 +175,10 @@ fn run(
         hooks.push(hook);
     }
 
+    // Display changes are only broadcast to top-level windows, so keep a
+    // hidden one. Without it rivewm still works, just without hot-plug.
+    let display_window = create_display_window();
+
     let (mut registered, failed) = register_hotkeys(&hotkeys);
     let _ = ready_tx.send(Ok((unsafe { GetCurrentThreadId() }, failed)));
 
@@ -204,6 +215,11 @@ fn run(
 
     unregister_hotkeys(&registered);
     unhook_all(&hooks);
+    if let Some(window) = display_window {
+        unsafe {
+            let _ = DestroyWindow(window);
+        }
+    }
 }
 
 /// Registers hotkeys on the calling thread, using each one's index as its
@@ -281,4 +297,49 @@ fn translate(event: u32, id: WindowId) -> Option<WindowEvent> {
         EVENT_OBJECT_UNCLOAKED => WindowEvent::Uncloaked(id),
         _ => return None,
     })
+}
+
+/// A hidden window that turns display-change broadcasts into
+/// [`Event::DisplayChanged`].
+fn create_display_window() -> Option<HWND> {
+    unsafe {
+        let instance = GetModuleHandleW(None).ok()?;
+        let class = w!("rivewm-display-listener");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(display_wndproc),
+            hInstance: instance.into(),
+            lpszClassName: class,
+            ..Default::default()
+        };
+        // Fails harmlessly if the class already exists.
+        RegisterClassW(&wc);
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            class,
+            w!("rivewm"),
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )
+        .ok()
+    }
+}
+
+unsafe extern "system" fn display_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let work_area_changed = msg == WM_SETTINGCHANGE && wparam.0 as u32 == SPI_SETWORKAREA.0;
+    if msg == WM_DISPLAYCHANGE || work_area_changed {
+        emit(Event::DisplayChanged);
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }

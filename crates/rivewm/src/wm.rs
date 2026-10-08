@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
 use rivewm_core::tree::NodeKind;
-use rivewm_core::{Axis, Command, Direction, Layout, NodeId, Rect, Tree, WindowEvent, WindowId};
+use rivewm_core::{
+    Axis, Command, Direction, Layout, MonitorSpec, NodeId, Rect, Tree, WindowEvent, WindowId,
+};
 use rivewm_platform::WindowInfo;
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
@@ -45,18 +47,59 @@ enum Drop {
 
 impl Wm {
     /// Creates one workspace per attached monitor, named "1", "2", ...
+    /// (the primary monitor gets "1").
     pub fn new(config: Config) -> Self {
         let mut tree = Tree::new();
-        for (i, m) in rivewm_platform::monitors().into_iter().enumerate() {
-            let monitor = tree.add_monitor(m.id, m.bounds, m.work_area);
+        for (i, spec) in monitor_specs().iter().enumerate() {
+            let monitor = tree.add_monitor(spec);
             tree.add_workspace(monitor, (i + 1).to_string(), Layout::Manual);
-            info!(device = %m.device, work_area = %m.work_area, "added monitor");
+            info!(device = spec.name, work_area = %spec.work_area, "added monitor");
         }
         Self {
             tree,
             config,
             fullscreen: BTreeSet::new(),
         }
+    }
+
+    /// Re-reads the attached monitors after a display change and moves
+    /// workspaces and windows to match (see `Tree::sync_monitors`).
+    pub fn sync_monitors(&mut self) {
+        let specs = monitor_specs();
+        let before = self.visible_windows();
+        if !self.tree.sync_monitors(&specs) {
+            return;
+        }
+        info!(
+            monitors = ?specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            "monitors changed"
+        );
+        let after = self.visible_windows();
+        // Uncloak first, so nothing flashes off and back on.
+        for &id in after.difference(&before) {
+            cloak(id, false);
+        }
+        for &id in before.difference(&after) {
+            cloak(id, true);
+        }
+        self.apply_all();
+        for id in after {
+            if self.tree.is_floating(id) {
+                self.place_floating(id);
+            }
+        }
+        if let Some(ws) = self.tree.focused_workspace() {
+            self.focus_os(ws);
+        }
+    }
+
+    /// Windows on workspaces currently shown on some monitor.
+    fn visible_windows(&self) -> BTreeSet<WindowId> {
+        self.tree
+            .monitors()
+            .filter_map(|m| self.tree.active_workspace(m))
+            .flat_map(|ws| self.tree.workspace_windows(ws))
+            .collect()
     }
 
     /// Swaps in a reloaded config. New gaps and the floating on-top setting
@@ -726,6 +769,22 @@ fn window_json(id: WindowId, rect: Option<Rect>, weight: Option<f64>) -> Value {
 
 fn rect_json(r: Rect) -> Value {
     json!({ "x": r.x, "y": r.y, "width": r.width, "height": r.height })
+}
+
+/// Attached monitors, primary first: it's the one that inherits workspaces
+/// from monitors that disconnect.
+fn monitor_specs() -> Vec<MonitorSpec> {
+    let mut monitors = rivewm_platform::monitors();
+    monitors.sort_by_key(|m| !m.primary);
+    monitors
+        .into_iter()
+        .map(|m| MonitorSpec {
+            id: m.id,
+            name: m.device,
+            bounds: m.bounds,
+            work_area: m.work_area,
+        })
+        .collect()
 }
 
 fn focus_os_window(id: WindowId) {

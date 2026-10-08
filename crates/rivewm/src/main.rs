@@ -5,8 +5,8 @@ mod wm;
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, SyncSender};
-use std::time::Duration;
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use config::Config;
@@ -76,6 +76,9 @@ enum Msg {
     /// An IPC client subscribed; send it event lines here.
     Subscribe(SyncSender<String>),
 }
+
+/// How long display changes must stop before monitors are re-read.
+const DISPLAY_SETTLE_TIME: Duration = Duration::from_millis(500);
 
 /// Events a subscriber may have queued before we drop it as too slow.
 const SUBSCRIBER_BACKLOG: usize = 256;
@@ -155,10 +158,33 @@ fn run(config_path: &Path) -> Result<()> {
         subscribers: Vec::new(),
         last_snapshot: Snapshot::default(),
     };
-    for msg in rx {
+    // Display changes arrive in bursts while monitors settle; act once, a
+    // little after the last one.
+    let mut resync_monitors_at: Option<Instant> = None;
+    loop {
+        let msg = match resync_monitors_at {
+            Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                Ok(msg) => msg,
+                Err(RecvTimeoutError::Timeout) => {
+                    resync_monitors_at = None;
+                    app.wm.sync_monitors();
+                    app.publish_changes();
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() {
+                Ok(msg) => msg,
+                Err(_) => break,
+            },
+        };
         let flow = match msg {
             Msg::Event(Event::Window(event)) => {
                 app.wm.handle(event);
+                ControlFlow::Continue(())
+            }
+            Msg::Event(Event::DisplayChanged) => {
+                resync_monitors_at = Some(Instant::now() + DISPLAY_SETTLE_TIME);
                 ControlFlow::Continue(())
             }
             Msg::Event(Event::Hotkey(i)) => match app.commands.get(i).cloned() {

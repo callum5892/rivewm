@@ -53,6 +53,16 @@ impl Direction {
     }
 }
 
+/// A monitor as the OS reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorSpec {
+    pub id: MonitorId,
+    /// Stable across display changes, unlike `id` (e.g. `\\.\DISPLAY2`).
+    pub name: String,
+    pub bounds: Rect,
+    pub work_area: Rect,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Gaps {
     /// Space between adjacent windows.
@@ -75,6 +85,9 @@ pub enum NodeKind {
     Root,
     Monitor {
         id: MonitorId,
+        /// Stable name used to recognise the monitor across display changes
+        /// (e.g. `\\.\DISPLAY2`), since `id` can change.
+        name: String,
         /// The whole monitor; fullscreen windows cover this.
         bounds: Rect,
         /// The monitor minus the taskbar; tiles fill this.
@@ -93,6 +106,9 @@ pub enum NodeKind {
         floating: Vec<NodeId>,
         /// A window (tiled or floating) covering the whole monitor.
         fullscreen: Option<NodeId>,
+        /// Name of the monitor this workspace was moved off when that
+        /// monitor disconnected; it moves back if the monitor returns.
+        home: Option<String>,
     },
     Split {
         axis: Axis,
@@ -359,15 +375,200 @@ impl Tree {
 
     // ---- Monitors & workspaces --------------------------------------------
 
-    pub fn add_monitor(&mut self, id: MonitorId, bounds: Rect, work_area: Rect) -> NodeId {
+    pub fn add_monitor(&mut self, spec: &MonitorSpec) -> NodeId {
         let node = self.alloc(NodeKind::Monitor {
-            id,
-            bounds,
-            work_area,
+            id: spec.id,
+            name: spec.name.clone(),
+            bounds: spec.bounds,
+            work_area: spec.work_area,
             active_workspace: None,
         });
         self.insert_child(self.root, self.node(self.root).children.len(), node);
         node
+    }
+
+    /// Brings the monitors in line with what's attached now, after a display
+    /// change. Monitors are matched by name.
+    ///
+    /// - A monitor that's gone hands its workspaces to the first monitor in
+    ///   `specs` (put the primary first), hidden, each remembering where it
+    ///   came from. Empty ones are dropped.
+    /// - A monitor that's back reclaims the workspaces it lost; a new one
+    ///   gets a fresh workspace named with the lowest unused number.
+    /// - A monitor that moved or resized keeps its workspaces; floating
+    ///   windows keep their position relative to it.
+    ///
+    /// Every monitor ends up showing a workspace, and focus stays on a
+    /// visible one. An empty `specs` (seen briefly while displays sleep) is
+    /// ignored. Returns whether anything changed.
+    pub fn sync_monitors(&mut self, specs: &[MonitorSpec]) -> bool {
+        if specs.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+
+        let mut gone = Vec::new();
+        for monitor in self.monitors().collect::<Vec<_>>() {
+            match specs.iter().find(|s| s.name == self.monitor_name(monitor)) {
+                Some(spec) => changed |= self.update_monitor(monitor, spec),
+                None => gone.push(monitor),
+            }
+        }
+
+        let mut added = Vec::new();
+        for spec in specs {
+            if self.monitor_by_name(&spec.name).is_none() {
+                added.push(self.add_monitor(spec));
+                changed = true;
+            }
+        }
+
+        let fallback = self
+            .monitor_by_name(&specs[0].name)
+            .expect("just ensured every spec has a monitor");
+        for monitor in gone {
+            let name = self.monitor_name(monitor).to_owned();
+            for ws in self.node(monitor).children.clone() {
+                if self.workspace_windows(ws).is_empty() {
+                    if self.focused_workspace == Some(ws) {
+                        self.focused_workspace = None;
+                    }
+                    self.detach(ws);
+                    self.release(ws);
+                    continue;
+                }
+                if let NodeKind::Workspace { home, .. } = &mut self.node_mut(ws).kind {
+                    home.get_or_insert_with(|| name.clone());
+                }
+                self.move_workspace(ws, fallback);
+            }
+            self.detach(monitor);
+            self.release(monitor);
+            changed = true;
+        }
+
+        for &monitor in &added {
+            let name = self.monitor_name(monitor).to_owned();
+            let returning: Vec<_> = self
+                .workspaces()
+                .filter(|&ws| self.workspace_home(ws) == Some(&name))
+                .collect();
+            for ws in returning {
+                if let NodeKind::Workspace { home, .. } = &mut self.node_mut(ws).kind {
+                    *home = None;
+                }
+                self.move_workspace(ws, monitor);
+            }
+        }
+
+        for monitor in self.monitors().collect::<Vec<_>>() {
+            self.ensure_active_workspace(monitor);
+        }
+        let focus_ok = self
+            .focused_workspace
+            .is_some_and(|ws| self.is_workspace_active(ws));
+        if !focus_ok {
+            self.focused_workspace = self.active_workspace(fallback);
+        }
+        changed
+    }
+
+    /// Updates a monitor's id and geometry. Floating windows on it keep
+    /// their place relative to the work area. Returns whether it changed.
+    fn update_monitor(&mut self, monitor: NodeId, spec: &MonitorSpec) -> bool {
+        let old_area = self.monitor_work_area(monitor);
+        let NodeKind::Monitor {
+            id,
+            bounds,
+            work_area,
+            ..
+        } = &mut self.node_mut(monitor).kind
+        else {
+            unreachable!("not a monitor");
+        };
+        if (*id, *bounds, *work_area) == (spec.id, spec.bounds, spec.work_area) {
+            return false;
+        }
+        (*id, *bounds, *work_area) = (spec.id, spec.bounds, spec.work_area);
+        for ws in self.node(monitor).children.clone() {
+            self.translate_floats(ws, old_area, spec.work_area);
+        }
+        true
+    }
+
+    /// Moves a workspace, hidden, to another monitor, keeping its floating
+    /// windows' relative positions. The monitor it left may be left without
+    /// an active workspace; see [`Self::ensure_active_workspace`].
+    fn move_workspace(&mut self, ws: NodeId, to: NodeId) {
+        let from = self.monitor_of(ws);
+        if let NodeKind::Monitor {
+            active_workspace, ..
+        } = &mut self.node_mut(from).kind
+            && *active_workspace == Some(ws)
+        {
+            *active_workspace = None;
+        }
+        let (from_area, to_area) = (self.monitor_work_area(from), self.monitor_work_area(to));
+        self.detach(ws);
+        self.attach_workspace(to, ws);
+        self.translate_floats(ws, from_area, to_area);
+    }
+
+    /// Gives a monitor an active workspace if it has none: its first one, or
+    /// a new one named with the lowest unused number.
+    fn ensure_active_workspace(&mut self, monitor: NodeId) {
+        if self.active_workspace(monitor).is_some() {
+            return;
+        }
+        let ws = match self.node(monitor).children.first() {
+            Some(&ws) => ws,
+            None => {
+                let name = (1..)
+                    .map(|n: u32| n.to_string())
+                    .find(|n| self.workspace_by_name(n).is_none())
+                    .expect("some number is free");
+                self.add_workspace(monitor, name, Layout::default())
+            }
+        };
+        if let NodeKind::Monitor {
+            active_workspace, ..
+        } = &mut self.node_mut(monitor).kind
+        {
+            *active_workspace = Some(ws);
+        }
+    }
+
+    fn translate_floats(&mut self, ws: NodeId, from: Rect, to: Rect) {
+        if from == to {
+            return;
+        }
+        for node in self.floating_nodes(ws).to_vec() {
+            if let NodeKind::Window {
+                float_rect: Some(r),
+                ..
+            } = &mut self.node_mut(node).kind
+            {
+                *r = translate_into(*r, from, to);
+            }
+        }
+    }
+
+    pub fn monitor_name(&self, monitor: NodeId) -> &str {
+        match &self.node(monitor).kind {
+            NodeKind::Monitor { name, .. } => name,
+            _ => panic!("{monitor:?} is not a monitor"),
+        }
+    }
+
+    fn monitor_by_name(&self, name: &str) -> Option<NodeId> {
+        self.monitors().find(|&m| self.monitor_name(m) == name)
+    }
+
+    fn workspace_home(&self, ws: NodeId) -> Option<&String> {
+        match &self.node(ws).kind {
+            NodeKind::Workspace { home, .. } => home.as_ref(),
+            _ => None,
+        }
     }
 
     /// Adds a workspace to a monitor. The first workspace on a monitor becomes
@@ -385,9 +586,22 @@ impl Tree {
             focus: None,
             floating: Vec::new(),
             fullscreen: None,
+            home: None,
         });
-        // Keep workspaces ordered by name (numerically where possible) so a
-        // status bar can list them as-is.
+        self.attach_workspace(monitor, ws);
+        if let NodeKind::Monitor {
+            active_workspace, ..
+        } = &mut self.node_mut(monitor).kind
+        {
+            active_workspace.get_or_insert(ws);
+        }
+        self.focused_workspace.get_or_insert(ws);
+        ws
+    }
+
+    /// Puts a detached workspace on a monitor, keeping workspaces ordered by
+    /// name (numerically where possible) so a status bar can list them as-is.
+    fn attach_workspace(&mut self, monitor: NodeId, ws: NodeId) {
         let key = workspace_sort_key(self.workspace_name(ws));
         let at = self
             .node(monitor)
@@ -397,14 +611,6 @@ impl Tree {
             .unwrap_or(self.node(monitor).children.len());
         self.node_mut(ws).parent = Some(monitor);
         self.node_mut(monitor).children.insert(at, ws);
-        if let NodeKind::Monitor {
-            active_workspace, ..
-        } = &mut self.node_mut(monitor).kind
-        {
-            active_workspace.get_or_insert(ws);
-        }
-        self.focused_workspace.get_or_insert(ws);
-        ws
     }
 
     /// Makes `ws` the active workspace on its monitor and gives it focus.
@@ -620,9 +826,7 @@ impl Tree {
             let from = self.monitor_work_area(self.monitor_of(source));
             let to = self.monitor_work_area(self.monitor_of(target));
             if let Some(r) = self.float_rect(window) {
-                let x = to.x + (r.x - from.x).clamp(0, (to.width - r.width).max(0));
-                let y = to.y + (r.y - from.y).clamp(0, (to.height - r.height).max(0));
-                self.set_float_rect(window, Rect::new(x, y, r.width, r.height));
+                self.set_float_rect(window, translate_into(r, from, to));
             }
             self.node_mut(node).parent = Some(target);
             self.floating_nodes_mut(target).push(node);
@@ -1271,6 +1475,14 @@ fn neighbour<T: Copy>(
         .map(|(_, id)| id)
 }
 
+/// Moves `r` from area `from` to area `to`, keeping its offset from the
+/// top-left corner but nudging it back inside if `to` is smaller.
+fn translate_into(r: Rect, from: Rect, to: Rect) -> Rect {
+    let x = to.x + (r.x - from.x).clamp(0, (to.width - r.width).max(0));
+    let y = to.y + (r.y - from.y).clamp(0, (to.height - r.height).max(0));
+    Rect::new(x, y, r.width, r.height)
+}
+
 /// Numeric names sort numerically ("2" < "10") and before other names.
 fn workspace_sort_key(name: &str) -> (u64, String) {
     (name.parse().unwrap_or(u64::MAX), name.to_owned())
@@ -1288,15 +1500,29 @@ mod tests {
         WindowId(n)
     }
 
+    /// A monitor with a 40px taskbar along the bottom of `bounds`.
+    fn spec(id: isize, name: &str, bounds: Rect) -> MonitorSpec {
+        MonitorSpec {
+            id: MonitorId(id),
+            name: name.into(),
+            bounds,
+            work_area: Rect::new(bounds.x, bounds.y, bounds.width, bounds.height - 40),
+        }
+    }
+
+    fn left_spec() -> MonitorSpec {
+        spec(1, "L", Rect::new(0, 0, 1000, 540))
+    }
+
+    /// Offset upwards, like a real mismatched desk setup.
+    fn right_spec() -> MonitorSpec {
+        spec(2, "R", Rect::new(1000, -30, 800, 520))
+    }
+
     /// A tree with one 1000x500 monitor and one manual workspace.
     fn setup() -> (Tree, NodeId) {
         let mut tree = Tree::new();
-        // 40px taskbar along the bottom.
-        let mon = tree.add_monitor(
-            MonitorId(1),
-            Rect::new(0, 0, 1000, 540),
-            Rect::new(0, 0, 1000, 500),
-        );
+        let mon = tree.add_monitor(&left_spec());
         let ws = tree.add_workspace(mon, "1", Layout::Manual);
         (tree, ws)
     }
@@ -1490,23 +1716,119 @@ mod tests {
         assert_eq!(tree.focused_window(), Some(w(3)));
     }
 
-    /// Two monitors side by side, the right one offset upwards like a real
-    /// mismatched desk setup.
+    /// Two monitors side by side.
     fn setup_dual() -> (Tree, NodeId, NodeId) {
         let mut tree = Tree::new();
-        let left = tree.add_monitor(
-            MonitorId(1),
-            Rect::new(0, 0, 1000, 540),
-            Rect::new(0, 0, 1000, 500),
-        );
-        let right = tree.add_monitor(
-            MonitorId(2),
-            Rect::new(1000, -30, 800, 520),
-            Rect::new(1000, -30, 800, 480),
-        );
+        let left = tree.add_monitor(&left_spec());
+        let right = tree.add_monitor(&right_spec());
         let ws1 = tree.add_workspace(left, "1", Layout::Manual);
         let ws2 = tree.add_workspace(right, "2", Layout::Manual);
         (tree, ws1, ws2)
+    }
+
+    fn names(tree: &Tree, monitor: NodeId) -> Vec<&str> {
+        let children = &tree.node(monitor).children;
+        children.iter().map(|&ws| tree.workspace_name(ws)).collect()
+    }
+
+    #[test]
+    fn unchanged_monitors_are_a_no_op() {
+        let (mut tree, ..) = setup_dual();
+        assert!(!tree.sync_monitors(&[left_spec(), right_spec()]));
+        assert!(!tree.sync_monitors(&[]));
+        assert_eq!(tree.monitors().count(), 2);
+    }
+
+    #[test]
+    fn unplugged_monitor_hands_workspaces_to_primary_and_reclaims_them() {
+        let (mut tree, ws1, ws2) = setup_dual();
+        open(&mut tree, ws1, &[1]);
+        tree.focus_workspace(ws2);
+        open(&mut tree, ws2, &[2, 3]);
+        tree.insert_floating(ws2, w(4), Rect::new(1100, 20, 100, 100));
+        tree.add_workspace(tree.monitor_of(ws2), "5", Layout::Manual);
+
+        // Unplug the right monitor while its workspace has focus.
+        assert!(tree.sync_monitors(&[left_spec()]));
+        let left = tree.monitors().next().unwrap();
+        assert_eq!(tree.monitors().count(), 1);
+        assert_eq!(names(&tree, left), ["1", "2"], "empty \"5\" is dropped");
+        assert!(tree.is_workspace_active(ws1));
+        assert!(!tree.is_workspace_active(ws2));
+        assert_eq!(tree.focused_workspace(), Some(ws1));
+        assert_eq!(tree.debug_layout(ws2), "H[2 3] F[4]");
+        // The float keeps its offset within the monitor.
+        assert_eq!(tree.float_rect(w(4)), Some(Rect::new(100, 50, 100, 100)));
+
+        // Plug it back in, with a new HMONITOR as Windows may hand out.
+        let mut back = right_spec();
+        back.id = MonitorId(22);
+        assert!(tree.sync_monitors(&[left_spec(), back]));
+        let right = tree.monitor_by_id(MonitorId(22)).unwrap();
+        assert_eq!(names(&tree, left), ["1"]);
+        assert_eq!(names(&tree, right), ["2"]);
+        assert!(tree.is_workspace_active(ws2));
+        assert_eq!(tree.float_rect(w(4)), Some(Rect::new(1100, 20, 100, 100)));
+    }
+
+    #[test]
+    fn new_monitor_gets_lowest_free_workspace_number() {
+        let (mut tree, ..) = setup_dual();
+        let third = spec(3, "T", Rect::new(-800, 0, 800, 540));
+        assert!(tree.sync_monitors(&[left_spec(), right_spec(), third]));
+        let t = tree.monitor_by_id(MonitorId(3)).unwrap();
+        assert_eq!(names(&tree, t), ["3"]);
+        let ws = tree.active_workspace(t).unwrap();
+        assert_eq!(tree.workspace_name(ws), "3");
+    }
+
+    #[test]
+    fn unplugging_the_primary_falls_back_to_whatever_remains() {
+        let (mut tree, ws1, ws2) = setup_dual();
+        open(&mut tree, ws1, &[1]);
+        assert!(tree.sync_monitors(&[right_spec()]));
+        let right = tree.monitors().next().unwrap();
+        assert_eq!(names(&tree, right), ["1", "2"]);
+        assert!(tree.is_workspace_active(ws2));
+        assert_eq!(tree.focused_workspace(), Some(ws2));
+    }
+
+    #[test]
+    fn resized_monitor_keeps_workspaces_and_moves_floats() {
+        let (mut tree, ws1, _) = setup_dual();
+        tree.insert_floating(ws1, w(1), Rect::new(900, 0, 100, 100));
+        // Narrower now, e.g. a resolution change.
+        let smaller = spec(1, "L", Rect::new(0, 0, 800, 540));
+        assert!(tree.sync_monitors(&[smaller, right_spec()]));
+        let left = tree.monitor_of(ws1);
+        assert_eq!(tree.monitor_work_area(left).width, 800);
+        assert_eq!(tree.float_rect(w(1)), Some(Rect::new(700, 0, 100, 100)));
+        assert!(tree.is_workspace_active(ws1));
+    }
+
+    #[test]
+    fn hidden_workspace_returns_hidden_when_its_monitor_does() {
+        let (mut tree, ws1, ws2) = setup_dual();
+        let right = tree.monitor_of(ws2);
+        open(&mut tree, ws1, &[1]);
+        tree.focus_workspace(ws2);
+        open(&mut tree, ws2, &[2]);
+        let ws3 = tree.add_workspace(right, "3", Layout::Manual);
+        tree.focus_workspace(ws3);
+        open(&mut tree, ws3, &[3]);
+
+        tree.sync_monitors(&[left_spec()]);
+        tree.sync_monitors(&[left_spec(), right_spec()]);
+        let right = tree.monitor_by_id(MonitorId(2)).unwrap();
+        assert_eq!(names(&tree, right), ["2", "3"]);
+        // One of them is shown; the other stays hidden.
+        assert_eq!(
+            [ws2, ws3]
+                .iter()
+                .filter(|&&ws| tree.is_workspace_active(ws))
+                .count(),
+            1
+        );
     }
 
     #[test]
