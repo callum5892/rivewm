@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use rivewm_core::{Command, Gaps, Layout};
-use rivewm_platform::{Hotkey, WindowInfo};
+use rivewm_platform::{BorderColor, Hotkey, WindowInfo};
 use serde::Deserialize;
 use tracing::info;
 
@@ -23,8 +23,35 @@ pub struct Config {
     pub floating_on_top: bool,
     /// Layout for newly created workspaces.
     pub default_layout: Layout,
+    pub border: Border,
     pub bindings: Vec<(Hotkey, Command)>,
     pub rules: Vec<Rule>,
+}
+
+/// Window border colours, applied to every managed window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Border {
+    pub enabled: bool,
+    pub focused: BorderColor,
+    pub unfocused: BorderColor,
+}
+
+/// `"#rrggbb"`, `"default"` or `"none"`.
+fn parse_color(text: &str) -> Result<BorderColor> {
+    match text {
+        "default" => Ok(BorderColor::Default),
+        "none" => Ok(BorderColor::Hidden),
+        _ => {
+            let hex = text
+                .strip_prefix('#')
+                .filter(|h| h.len() == 6)
+                .and_then(|h| u32::from_str_radix(h, 16).ok());
+            match hex {
+                Some(v) => Ok(BorderColor::Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)),
+                None => bail!("bad colour `{text}`: use \"#rrggbb\", \"default\" or \"none\""),
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -95,6 +122,7 @@ pub fn load(path: &Path) -> Result<Config> {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     gaps: Option<RawGaps>,
+    border: Option<RawBorder>,
     floating: Option<RawFloating>,
     layout: Option<RawLayout>,
     keybindings: Option<BTreeMap<String, String>>,
@@ -106,6 +134,14 @@ struct RawConfig {
 struct RawGaps {
     inner: Option<i32>,
     outer: Option<i32>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawBorder {
+    enabled: Option<bool>,
+    focused: Option<String>,
+    unfocused: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -157,6 +193,21 @@ pub fn parse(text: &str) -> Result<Config> {
         .map_err(anyhow::Error::msg)
         .context("in [layout]")?;
 
+    let user_border = user.border.unwrap_or_default();
+    let default_border = defaults.border.unwrap_or_default();
+    let color = |user: Option<String>, default: Option<String>, key: &str| {
+        let text = user.or(default).unwrap_or_else(|| "default".into());
+        parse_color(&text).with_context(|| format!("in [border] {key}"))
+    };
+    let border = Border {
+        enabled: user_border
+            .enabled
+            .or(default_border.enabled)
+            .unwrap_or(false),
+        focused: color(user_border.focused, default_border.focused, "focused")?,
+        unfocused: color(user_border.unfocused, default_border.unfocused, "unfocused")?,
+    };
+
     let floating_on_top = user
         .floating
         .and_then(|f| f.on_top)
@@ -189,6 +240,7 @@ pub fn parse(text: &str) -> Result<Config> {
         gaps,
         floating_on_top,
         default_layout,
+        border,
         bindings,
         rules,
     })
@@ -257,6 +309,34 @@ mod tests {
         let config = parse("[gaps]\ninner = 2\n").unwrap();
         assert_eq!(config.gaps, Gaps { inner: 2, outer: 8 });
         assert_eq!(config.bindings.len(), 48);
+    }
+
+    #[test]
+    fn border_colours() {
+        let defaults = parse(DEFAULT_CONFIG).unwrap().border;
+        assert!(defaults.enabled);
+        assert_eq!(defaults.focused, BorderColor::Rgb(0x33, 0xcc, 0xff));
+        assert_eq!(defaults.unfocused, BorderColor::Rgb(0x59, 0x59, 0x59));
+
+        let custom = parse("[border]\nfocused = \"#FF0080\"\nunfocused = \"default\"")
+            .unwrap()
+            .border;
+        assert_eq!(custom.focused, BorderColor::Rgb(0xff, 0x00, 0x80));
+        assert_eq!(custom.unfocused, BorderColor::Default);
+        assert_eq!(
+            parse("[border]\nunfocused = \"none\"")
+                .unwrap()
+                .border
+                .unfocused,
+            BorderColor::Hidden
+        );
+        assert!(!parse("[border]\nenabled = false").unwrap().border.enabled);
+
+        for bad in ["#12345", "#gggggg", "red", "33ccff"] {
+            let text = format!("[border]\nfocused = \"{bad}\"");
+            let err = format!("{:#}", parse(&text).unwrap_err());
+            assert!(err.contains("focused") && err.contains(bad), "{err}");
+        }
     }
 
     #[test]

@@ -19,6 +19,15 @@ outer = 8
 # Change the focused workspace's layout any time with the `layout` command.
 default = "dwindle"
 
+[border]
+# Colour the focused window's border so it's easy to spot, like Hyprland.
+# Uses Windows 11's own 1px window border, which follows the window exactly.
+enabled = true
+# Colours are "#rrggbb", or "default" (Windows' usual border) or "none".
+focused = "#33ccff"
+# Every other window rivewm manages.
+unfocused = "#595959"
+
 [floating]
 # Keep floating windows (dialogs, picture-in-picture, anything toggled with
 # toggle-floating) above tiled windows. Uses Windows' "always on top", so

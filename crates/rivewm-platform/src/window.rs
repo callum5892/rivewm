@@ -3,7 +3,8 @@ use std::ffi::c_void;
 use rivewm_core::{MonitorId, Rect, WindowId};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
+    DWMWA_BORDER_COLOR, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
+    DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -116,6 +117,35 @@ pub fn focus_desktop() -> bool {
     unsafe {
         let desktop = GetShellWindow();
         !desktop.is_invalid() && SetForegroundWindow(desktop).as_bool()
+    }
+}
+
+/// A window border colour for [`set_border_color`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderColor {
+    /// Whatever Windows would normally draw.
+    Default,
+    /// No border at all.
+    Hidden,
+    Rgb(u8, u8, u8),
+}
+
+/// Recolours a window's own 1px border (Windows 11 and later; fails
+/// harmlessly on Windows 10). Works on other processes' windows.
+pub fn set_border_color(id: WindowId, color: BorderColor) -> windows::core::Result<()> {
+    // COLORREF is 0x00BBGGRR, with two reserved sentinel values.
+    let value: u32 = match color {
+        BorderColor::Default => 0xFFFF_FFFF,
+        BorderColor::Hidden => 0xFFFF_FFFE,
+        BorderColor::Rgb(r, g, b) => (b as u32) << 16 | (g as u32) << 8 | r as u32,
+    };
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd(id),
+            DWMWA_BORDER_COLOR,
+            &value as *const u32 as *const c_void,
+            size_of::<u32>() as u32,
+        )
     }
 }
 

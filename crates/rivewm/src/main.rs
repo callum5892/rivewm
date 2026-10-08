@@ -31,6 +31,8 @@ USAGE:
     rivewm --autostart [on|off]
                              Start rivewm in the background at login (or show
                              whether it will)
+    rivewm --check-config    Check the config file for mistakes without
+                             starting anything
     rivewm msg <request>     Send a request to the running rivewm and print
                              its JSON reply. A request is any config command
                              (e.g. `workspace 3`, `focus-window 0x1a2b`) or
@@ -77,6 +79,16 @@ fn main() -> Result<()> {
         Some("--background") => background::start(&config_path),
         Some("--autostart") => {
             background::autostart_cli(args.get(1).map(String::as_str), &config_path)
+        }
+        Some("--check-config") => {
+            let config = config::load(&config_path)?;
+            println!(
+                "{} is valid: {} bindings, {} rules.",
+                config_path.display(),
+                config.bindings.len(),
+                config.rules.len()
+            );
+            Ok(())
         }
         Some("msg") => msg(&args[1..]),
         Some("--list") => list(args.iter().any(|a| a == "--all")),
@@ -186,12 +198,20 @@ fn run(config_path: &Path) -> Result<()> {
     // little after the last one.
     let mut resync_monitors_at: Option<Instant> = None;
     loop {
-        let msg = match resync_monitors_at {
+        // Sleep until the next message or whichever timer is due first.
+        let deadline = [resync_monitors_at, app.wm.next_timer()]
+            .into_iter()
+            .flatten()
+            .min();
+        let msg = match deadline {
             Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
                 Ok(msg) => msg,
                 Err(RecvTimeoutError::Timeout) => {
-                    resync_monitors_at = None;
-                    app.wm.sync_monitors();
+                    if resync_monitors_at.is_some_and(|at| at <= Instant::now()) {
+                        resync_monitors_at = None;
+                        app.wm.sync_monitors();
+                    }
+                    app.wm.on_timer();
                     app.publish_changes();
                     continue;
                 }

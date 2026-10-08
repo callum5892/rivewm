@@ -9,12 +9,13 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use rivewm_core::tree::NodeKind;
 use rivewm_core::{
     Axis, Command, Direction, Layout, MonitorSpec, NodeId, Rect, Tree, WindowEvent, WindowId,
 };
-use rivewm_platform::WindowInfo;
+use rivewm_platform::{BorderColor, WindowInfo};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
@@ -27,6 +28,9 @@ static MANAGED: Mutex<BTreeSet<WindowId>> = Mutex::new(BTreeSet::new());
 
 /// Windows we have cloaked, mirrored to disk for crash recovery.
 static CLOAKED: Mutex<BTreeSet<WindowId>> = Mutex::new(BTreeSet::new());
+
+/// How long after a focus change to paint borders again (see `sync_border`).
+const BORDER_REASSERT_DELAYS: [u64; 3] = [80, 250, 800];
 
 /// Floating windows we made always-on-top, so we can undo exactly those.
 static MADE_TOPMOST: Mutex<BTreeSet<WindowId>> = Mutex::new(BTreeSet::new());
@@ -44,6 +48,12 @@ pub struct Wm {
     /// The window being dragged and its frame when the drag began, to tell
     /// a move from a resize when it ends.
     drag_start: Option<(WindowId, Rect)>,
+    /// The window currently wearing the focused border colour.
+    bordered: Option<WindowId>,
+    /// The window that wore it before, which should now be unfocused-coloured.
+    unbordered: Option<WindowId>,
+    /// Re-paints still to come after the last focus change, soonest last.
+    border_reasserts: Vec<Instant>,
 }
 
 /// Where a dragged tiled window was dropped.
@@ -72,6 +82,9 @@ impl Wm {
             refused: RefCell::new(Vec::new()),
             unmovable: HashSet::new(),
             drag_start: None,
+            bordered: None,
+            unbordered: None,
+            border_reasserts: Vec::new(),
         }
     }
 
@@ -104,6 +117,7 @@ impl Wm {
         if let Some(ws) = self.tree.focused_workspace() {
             self.focus_os(ws);
         }
+        self.sync_border();
     }
 
     /// Windows on workspaces currently shown on some monitor.
@@ -121,10 +135,13 @@ impl Wm {
         self.config = config;
         self.tree.set_default_layout(self.config.default_layout);
         let managed: Vec<_> = lock(&MANAGED).iter().copied().collect();
-        for id in managed {
+        for &id in &managed {
             self.sync_topmost(id);
+            self.paint_border(id, self.config.border.unfocused);
         }
+        self.bordered = None;
         self.apply_all();
+        self.sync_border();
     }
 
     /// Manages every window that's already open, keeping tiled windows on
@@ -143,6 +160,7 @@ impl Wm {
             self.tree.focus_window(fg);
         }
         self.apply_all();
+        self.sync_border();
     }
 
     /// Runs a user command. Returns `Break` when the WM should exit.
@@ -150,6 +168,7 @@ impl Wm {
         let flow = self.run(command);
         self.sync_fullscreen();
         self.release_refused();
+        self.sync_border();
         flow
     }
 
@@ -260,6 +279,7 @@ impl Wm {
         self.on_event(event);
         self.sync_fullscreen();
         self.release_refused();
+        self.sync_border();
     }
 
     fn on_event(&mut self, event: WindowEvent) {
@@ -565,6 +585,76 @@ impl Wm {
         }
     }
 
+    /// Moves the focused border colour to whichever managed window has focus
+    /// now, repainting only the two windows involved. Nothing wears it while
+    /// focus is on a window rivewm doesn't manage (e.g. Task Manager or the
+    /// desktop).
+    fn sync_border(&mut self) {
+        let focused = self
+            .tree
+            .focused_window()
+            .filter(|_| self.config.border.enabled)
+            .filter(|&id| rivewm_platform::foreground_window() == Some(id));
+        if focused == self.bordered {
+            return;
+        }
+        if let Some(old) = self.bordered {
+            self.paint_border(old, self.config.border.unfocused);
+        }
+        if let Some(new) = focused {
+            self.paint_border(new, self.config.border.focused);
+        }
+        self.unbordered = self.bordered.filter(|&old| self.tree.contains_window(old));
+        self.bordered = focused;
+
+        // Some apps (Windows Terminal, Discord) reset their own border colour
+        // when they gain or lose focus, racing the paint above. Paint again
+        // a few times over the next second so ours lands last.
+        let now = Instant::now();
+        self.border_reasserts = BORDER_REASSERT_DELAYS
+            .iter()
+            .rev()
+            .map(|&ms| now + Duration::from_millis(ms))
+            .collect();
+    }
+
+    /// When [`Self::on_timer`] next needs to run, if at all.
+    pub fn next_timer(&self) -> Option<Instant> {
+        self.border_reasserts.last().copied()
+    }
+
+    /// Runs whatever timed work is due: currently re-painting borders.
+    pub fn on_timer(&mut self) {
+        let now = Instant::now();
+        let mut due = false;
+        while self.border_reasserts.last().is_some_and(|&at| at <= now) {
+            self.border_reasserts.pop();
+            due = true;
+        }
+        if !due {
+            return;
+        }
+        if let Some(id) = self.bordered {
+            self.paint_border(id, self.config.border.focused);
+        }
+        if let Some(id) = self.unbordered.filter(|&id| self.tree.contains_window(id)) {
+            self.paint_border(id, self.config.border.unfocused);
+        }
+    }
+
+    /// Colours a managed window's border, or leaves Windows' own if borders
+    /// are turned off.
+    fn paint_border(&self, id: WindowId, color: BorderColor) {
+        let color = if self.config.border.enabled {
+            color
+        } else {
+            BorderColor::Default
+        };
+        // Fails on Windows 10 and for windows that just closed; neither
+        // matters.
+        let _ = rivewm_platform::set_border_color(id, color);
+    }
+
     /// Makes a window always-on-top if it's floating and the config asks for
     /// that, and undoes it otherwise. Windows that were already on top by
     /// their own choice (e.g. picture-in-picture) are left alone.
@@ -797,6 +887,7 @@ impl Wm {
             cloak(info.id, true);
         }
         self.sync_topmost(info.id);
+        self.paint_border(info.id, self.config.border.unfocused);
         Some(ws)
     }
 
@@ -807,6 +898,11 @@ impl Wm {
         lock(&MANAGED).remove(&id);
         // No longer in the tree, so this undoes any always-on-top of ours.
         self.sync_topmost(id);
+        // Give it back its normal border. Fails harmlessly if it's gone.
+        let _ = rivewm_platform::set_border_color(id, BorderColor::Default);
+        if self.bordered == Some(id) {
+            self.bordered = None;
+        }
         info!(window = format_args!("{:#x}", id.0), "unmanaged");
         if self.tree.is_workspace_active(ws) {
             self.apply(ws);
@@ -939,13 +1035,14 @@ pub fn recover_cloaked() {
     let _ = std::fs::remove_file(path);
 }
 
-/// Makes every managed window visible again (uncloaked and shown) and drops
-/// any always-on-top we added. Safe to call from a panic hook or signal
+/// Makes every managed window visible again (uncloaked and shown), drops
+/// any always-on-top we added and restores normal borders. Safe to call from a panic hook or signal
 /// handler.
 pub fn restore_all() {
     for &id in lock(&MANAGED).iter() {
         let _ = rivewm_platform::set_cloaked(id, false);
         rivewm_platform::show_window(id);
+        let _ = rivewm_platform::set_border_color(id, BorderColor::Default);
     }
     for &id in lock(&MADE_TOPMOST).iter() {
         let _ = rivewm_platform::set_topmost(id, false);
