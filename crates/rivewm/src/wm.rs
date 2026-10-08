@@ -54,7 +54,7 @@ impl Wm {
             else {
                 continue;
             };
-            self.insert(ws, w.id, &w.title);
+            self.insert(ws, &w);
         }
         if let Some(fg) = rivewm_platform::foreground_window() {
             self.tree.focus_window(fg);
@@ -100,6 +100,17 @@ impl Wm {
                     self.tree.toggle_split(id);
                 }
             }
+            Command::ToggleFloating => {
+                if let Some(id) = focused
+                    && self.tree.toggle_floating(id)
+                    && let Some(ws) = self.workspace_of(id)
+                {
+                    if self.tree.is_floating(id) {
+                        self.place_floating(id);
+                    }
+                    self.apply(ws);
+                }
+            }
             Command::Resize { axis, delta } => {
                 if let Some(id) = focused
                     && self.tree.resize(id, axis, delta)
@@ -137,6 +148,9 @@ impl Wm {
                 }
             }
             WindowEvent::Focused(id) => self.on_focused(id),
+            WindowEvent::MoveSizeEnded(id) if self.tree.is_floating(id) => {
+                self.floating_moved(id);
+            }
             WindowEvent::MoveSizeEnded(id) => {
                 // The user dragged or resized a tiled window: snap it back.
                 if let Some(ws) = self.workspace_of(id) {
@@ -207,13 +221,51 @@ impl Wm {
             workspace = self.tree.workspace_name(ws),
             "sent to workspace"
         );
-        if self.tree.is_workspace_active(ws) {
-            self.apply(ws);
-        } else {
+        if !self.tree.is_workspace_active(ws) {
             cloak(id, true);
+        } else if self.tree.is_floating(id) {
+            self.place_floating(id);
+        } else {
+            self.apply(ws);
         }
         self.apply(source);
         self.focus_os(source);
+    }
+
+    /// The user finished dragging or resizing a floating window: remember
+    /// where it is, and if it was dropped on another monitor, hand it to the
+    /// workspace shown there.
+    fn floating_moved(&mut self, id: WindowId) {
+        let Some(info) = rivewm_platform::query_window(id) else {
+            return;
+        };
+        let dropped_on = self
+            .tree
+            .monitor_by_id(info.monitor)
+            .and_then(|m| self.tree.active_workspace(m));
+        if let Some(target) = dropped_on
+            && self.workspace_of(id) != Some(target)
+        {
+            self.tree.move_window_to_workspace(id, target);
+            self.tree.focus_window(id);
+            info!(
+                window = format_args!("{:#x}", id.0),
+                workspace = self.tree.workspace_name(target),
+                "floating window moved to workspace"
+            );
+        }
+        // After any move, so the translated position is replaced by the
+        // real one.
+        self.tree.set_float_rect(id, info.frame);
+    }
+
+    /// Puts a floating window where the tree says it floats.
+    fn place_floating(&self, id: WindowId) {
+        if let Some(rect) = self.tree.float_rect(id)
+            && let Err(err) = rivewm_platform::set_frame(id, rect)
+        {
+            warn!(window = format_args!("{:#x}", id.0), %err, "failed to position window");
+        }
     }
 
     /// Finds a workspace by name, creating it on the focused monitor if
@@ -267,17 +319,38 @@ impl Wm {
         if !info.is_manageable() || info.minimized {
             return;
         }
-        let Some(ws) = self.tree.focused_workspace() else {
+        // Tiled windows open on the focused workspace. Floating ones stay
+        // where the app put them, on whichever workspace that monitor shows.
+        let ws = if info.floating {
+            self.tree
+                .monitor_by_id(info.monitor)
+                .and_then(|m| self.tree.active_workspace(m))
+                .or(self.tree.focused_workspace())
+        } else {
+            self.tree.focused_workspace()
+        };
+        let Some(ws) = ws else {
             return;
         };
-        self.insert(ws, id, &info.title);
-        self.apply(ws);
+        self.insert(ws, &info);
+        if !info.floating {
+            self.apply(ws);
+        }
     }
 
-    fn insert(&mut self, ws: NodeId, id: WindowId, title: &str) {
-        self.tree.insert_window(ws, id);
-        lock(&MANAGED).insert(id);
-        info!(window = format_args!("{:#x}", id.0), title, "managing");
+    fn insert(&mut self, ws: NodeId, info: &rivewm_platform::WindowInfo) {
+        if info.floating {
+            self.tree.insert_floating(ws, info.id, info.frame);
+        } else {
+            self.tree.insert_window(ws, info.id);
+        }
+        lock(&MANAGED).insert(info.id);
+        info!(
+            window = format_args!("{:#x}", info.id.0),
+            title = info.title,
+            floating = info.floating,
+            "managing"
+        );
     }
 
     fn unmanage(&mut self, id: WindowId) {

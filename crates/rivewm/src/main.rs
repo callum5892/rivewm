@@ -14,10 +14,10 @@ rivewm - a tiling window manager for Windows
 
 USAGE:
     rivewm                   Run the window manager (Ctrl+C to quit)
-    rivewm --list [--all]    List monitors and tileable windows
+    rivewm --list [--all]    List monitors and the windows rivewm manages
                              (--all also shows skipped windows and why)
     rivewm --events [--all]  Log window events live until Ctrl+C
-                             (--all includes untileable windows)
+                             (--all includes unmanaged windows)
 ";
 
 fn main() -> Result<()> {
@@ -108,7 +108,7 @@ fn list(all: bool) -> Result<()> {
         .filter(|w| all || w.is_manageable())
         .collect();
     println!(
-        "\nWindows ({} tileable, {} total):",
+        "\nWindows ({} managed, {} total):",
         windows.iter().filter(|w| w.is_manageable()).count(),
         windows.len()
     );
@@ -119,8 +119,14 @@ fn list(all: bool) -> Result<()> {
             .map_or("?", |m| m.device.as_str());
         let status = match w.skip {
             Some(reason) => format!("skip:{reason}"),
-            None if w.minimized => "tile (minimized)".into(),
-            None => "tile".into(),
+            None => {
+                let mode = if w.floating { "float" } else { "tile" };
+                if w.minimized {
+                    format!("{mode} (minimized)")
+                } else {
+                    mode.into()
+                }
+            }
         };
         println!(
             "  {:#010x} {:<18} {:<22} {:<28} {:<20} {:<14} {}",
@@ -141,7 +147,7 @@ fn events(all: bool) -> Result<()> {
         rivewm_platform::EventThread::spawn(Vec::new()).context("failed to install hooks")?;
     let start = std::time::Instant::now();
 
-    // Windows we've seen as tileable. Hidden/destroyed windows can no longer
+    // Windows we've seen as manageable. Hidden/destroyed windows can no longer
     // be classified, so this is how we decide whether those events matter.
     let mut known: HashSet<WindowId> = rivewm_platform::enumerate_windows()
         .into_iter()
@@ -150,7 +156,7 @@ fn events(all: bool) -> Result<()> {
         .collect();
 
     println!(
-        "Listening for window events ({} tileable windows). Ctrl+C to stop.",
+        "Listening for window events ({} managed windows). Ctrl+C to stop.",
         known.len()
     );
     for event in rx.into_iter().filter_map(|e| match e {
@@ -159,11 +165,11 @@ fn events(all: bool) -> Result<()> {
     }) {
         let id = event.window();
         let info = rivewm_platform::query_window(id);
-        let tileable = info.as_ref().is_some_and(|w| w.is_manageable());
-        if tileable {
+        let manageable = info.as_ref().is_some_and(|w| w.is_manageable());
+        if manageable {
             known.insert(id);
         }
-        let relevant = tileable || known.contains(&id);
+        let relevant = manageable || known.contains(&id);
         if matches!(event, WindowEvent::Destroyed(_)) {
             known.remove(&id);
         }

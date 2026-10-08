@@ -33,7 +33,8 @@ impl Tree {
 
     fn manual_insert(&mut self, ws: NodeId, window: NodeId) {
         match self.workspace_focus(ws) {
-            Some(focused) => {
+            // A floating window has no place in the tree to insert beside.
+            Some(focused) if !self.node_is_floating(focused) => {
                 let parent = self
                     .node(focused)
                     .parent
@@ -46,7 +47,7 @@ impl Tree {
                 let idx = idx.expect("focused window missing from parent");
                 self.insert_child(parent, idx + 1, window);
             }
-            None => {
+            _ => {
                 let end = self.node(ws).children.len();
                 self.insert_child(ws, end, window);
             }

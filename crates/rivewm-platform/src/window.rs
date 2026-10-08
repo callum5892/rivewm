@@ -29,9 +29,6 @@ pub enum Skip {
     Child,
     ToolWindow,
     NoActivate,
-    /// Has an owner, so it's a dialog or popup of another window. These will
-    /// float rather than tile once floating exists.
-    Owned,
     NoTitle,
     /// Neither a caption nor a resizable frame, e.g. splash screens.
     NoFrame,
@@ -46,7 +43,6 @@ impl std::fmt::Display for Skip {
             Skip::Child => "child",
             Skip::ToolWindow => "tool-window",
             Skip::NoActivate => "no-activate",
-            Skip::Owned => "owned",
             Skip::NoTitle => "no-title",
             Skip::NoFrame => "no-frame",
             Skip::ZeroSize => "zero-size",
@@ -69,8 +65,11 @@ pub struct WindowInfo {
     pub window_rect: Rect,
     pub monitor: MonitorId,
     pub minimized: bool,
-    /// `None` means the window is a tiling candidate.
+    /// `None` means rivewm should manage the window.
     pub skip: Option<Skip>,
+    /// Whether to float it rather than tile it by default: dialogs and other
+    /// owned windows, and windows that can't be resized.
+    pub floating: bool,
 }
 
 impl WindowInfo {
@@ -185,7 +184,10 @@ fn window_info(hwnd: HWND) -> WindowInfo {
     let window_rect = window_rect(hwnd).unwrap_or_default();
     let frame = extended_frame_bounds(hwnd).unwrap_or(window_rect);
     let title = window_title(hwnd);
-    let skip = classify(hwnd, &title, frame);
+    let (skip, floating) = match classify(hwnd, &title, frame) {
+        Ok(floating) => (None, floating),
+        Err(skip) => (Some(skip), false),
+    };
     WindowInfo {
         id: WindowId(hwnd.0 as isize),
         title,
@@ -197,41 +199,42 @@ fn window_info(hwnd: HWND) -> WindowInfo {
         monitor: MonitorId(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }.0 as isize),
         minimized: unsafe { IsIconic(hwnd) }.as_bool(),
         skip,
+        floating,
     }
 }
 
-fn classify(hwnd: HWND, title: &str, frame: Rect) -> Option<Skip> {
+/// Decides how to treat a window: `Err` to leave it alone, otherwise
+/// whether it should float.
+fn classify(hwnd: HWND, title: &str, frame: Rect) -> Result<bool, Skip> {
     let style = WINDOW_STYLE(unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32);
     let ex_style = WINDOW_EX_STYLE(unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32);
 
     if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
-        return Some(Skip::Invisible);
+        return Err(Skip::Invisible);
     }
     if is_cloaked(hwnd) {
-        return Some(Skip::Cloaked);
+        return Err(Skip::Cloaked);
     }
     if style.contains(WS_CHILD) {
-        return Some(Skip::Child);
+        return Err(Skip::Child);
     }
     if ex_style.contains(WS_EX_TOOLWINDOW) && !ex_style.contains(WS_EX_APPWINDOW) {
-        return Some(Skip::ToolWindow);
+        return Err(Skip::ToolWindow);
     }
     if ex_style.contains(WS_EX_NOACTIVATE) {
-        return Some(Skip::NoActivate);
-    }
-    if unsafe { GetWindow(hwnd, GW_OWNER) }.is_ok_and(|owner| !owner.is_invalid()) {
-        return Some(Skip::Owned);
+        return Err(Skip::NoActivate);
     }
     if title.trim().is_empty() {
-        return Some(Skip::NoTitle);
+        return Err(Skip::NoTitle);
     }
     if !style.contains(WS_CAPTION) && !style.contains(WS_THICKFRAME) {
-        return Some(Skip::NoFrame);
+        return Err(Skip::NoFrame);
     }
     if frame.is_empty() {
-        return Some(Skip::ZeroSize);
+        return Err(Skip::ZeroSize);
     }
-    None
+    let owned = unsafe { GetWindow(hwnd, GW_OWNER) }.is_ok_and(|owner| !owner.is_invalid());
+    Ok(owned || !style.contains(WS_THICKFRAME))
 }
 
 fn is_cloaked(hwnd: HWND) -> bool {

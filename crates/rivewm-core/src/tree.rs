@@ -82,14 +82,22 @@ pub enum NodeKind {
         name: String,
         layout: Layout,
         axis: Axis,
-        /// Last focused window in this workspace.
+        /// Last focused window in this workspace (tiled or floating).
         focus: Option<NodeId>,
+        /// Floating windows, oldest first. They aren't part of the tiling
+        /// tree: their parent is this workspace, but they aren't among its
+        /// `children`.
+        floating: Vec<NodeId>,
     },
     Split {
         axis: Axis,
     },
     Window {
         id: WindowId,
+        floating: bool,
+        /// Where the window sits while floating. Remembered while it's tiled
+        /// so toggling back restores it.
+        float_rect: Option<Rect>,
     },
 }
 
@@ -162,16 +170,81 @@ impl Tree {
         None
     }
 
-    /// All windows in a workspace, in tree order.
+    /// All windows in a workspace: tiled ones in tree order, then floating.
     pub fn workspace_windows(&self, ws: NodeId) -> Vec<WindowId> {
         let mut out = Vec::new();
         self.collect_windows(ws, &mut out);
+        out.extend(self.floating_nodes(ws).iter().map(|&n| self.window_id(n)));
         out
+    }
+
+    /// Floating windows in a workspace with their positions, oldest first.
+    pub fn floating_windows(&self, ws: NodeId) -> Vec<(WindowId, Rect)> {
+        self.floating_nodes(ws)
+            .iter()
+            .filter_map(|&n| match self.node(n).kind {
+                NodeKind::Window { id, float_rect, .. } => Some((id, float_rect?)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn is_floating(&self, window: WindowId) -> bool {
+        self.window_node(window)
+            .is_some_and(|n| self.node_is_floating(n))
+    }
+
+    /// Where a window sits (or would sit) while floating.
+    pub fn float_rect(&self, window: WindowId) -> Option<Rect> {
+        match self.node(self.window_node(window)?).kind {
+            NodeKind::Window { float_rect, .. } => float_rect,
+            _ => None,
+        }
+    }
+
+    /// Records where a floating window is, e.g. after the user dragged it.
+    pub fn set_float_rect(&mut self, window: WindowId, rect: Rect) -> bool {
+        let Some(node) = self.window_node(window) else {
+            return false;
+        };
+        if let NodeKind::Window { float_rect, .. } = &mut self.node_mut(node).kind {
+            *float_rect = Some(rect);
+        }
+        true
+    }
+
+    pub(crate) fn node_is_floating(&self, node: NodeId) -> bool {
+        matches!(
+            self.node(node).kind,
+            NodeKind::Window { floating: true, .. }
+        )
+    }
+
+    fn floating_nodes(&self, ws: NodeId) -> &[NodeId] {
+        match &self.node(ws).kind {
+            NodeKind::Workspace { floating, .. } => floating,
+            _ => &[],
+        }
+    }
+
+    fn floating_nodes_mut(&mut self, ws: NodeId) -> &mut Vec<NodeId> {
+        match &mut self.node_mut(ws).kind {
+            NodeKind::Workspace { floating, .. } => floating,
+            _ => panic!("{ws:?} is not a workspace"),
+        }
+    }
+
+    /// Flips a window node between tiled and floating bookkeeping. Callers
+    /// handle tree membership.
+    fn set_node_floating(&mut self, node: NodeId, value: bool) {
+        if let NodeKind::Window { floating, .. } = &mut self.node_mut(node).kind {
+            *floating = value;
+        }
     }
 
     fn collect_windows(&self, node: NodeId, out: &mut Vec<WindowId>) {
         match self.node(node).kind {
-            NodeKind::Window { id } => out.push(id),
+            NodeKind::Window { id, .. } => out.push(id),
             _ => {
                 for &child in &self.node(node).children {
                     self.collect_windows(child, out);
@@ -196,7 +269,7 @@ impl Tree {
 
     fn window_id(&self, node: NodeId) -> WindowId {
         match self.node(node).kind {
-            NodeKind::Window { id } => id,
+            NodeKind::Window { id, .. } => id,
             _ => panic!("{node:?} is not a window"),
         }
     }
@@ -267,6 +340,7 @@ impl Tree {
             layout,
             axis: Axis::Horizontal,
             focus: None,
+            floating: Vec::new(),
         });
         // Keep workspaces ordered by name (numerically where possible) so a
         // status bar can list them as-is.
@@ -306,7 +380,7 @@ impl Tree {
 
     /// Deletes an empty, inactive workspace.
     pub fn remove_workspace(&mut self, ws: NodeId) {
-        assert!(self.node(ws).children.is_empty(), "workspace not empty");
+        assert!(self.workspace_windows(ws).is_empty(), "workspace not empty");
         assert!(!self.is_workspace_active(ws), "workspace is active");
         self.detach(ws);
         self.release(ws);
@@ -358,10 +432,71 @@ impl Tree {
             !self.windows.contains_key(&window),
             "{window:?} is already in the tree"
         );
-        let node = self.alloc(NodeKind::Window { id: window });
+        let node = self.alloc(NodeKind::Window {
+            id: window,
+            floating: false,
+            float_rect: None,
+        });
         self.windows.insert(window, node);
         self.layout_insert(ws, node);
         node
+    }
+
+    /// Adds a floating window to a workspace at `rect`. Does not change
+    /// focus.
+    pub fn insert_floating(&mut self, ws: NodeId, window: WindowId, rect: Rect) -> NodeId {
+        assert!(
+            !self.windows.contains_key(&window),
+            "{window:?} is already in the tree"
+        );
+        let node = self.alloc(NodeKind::Window {
+            id: window,
+            floating: true,
+            float_rect: Some(rect),
+        });
+        self.windows.insert(window, node);
+        self.node_mut(node).parent = Some(ws);
+        self.floating_nodes_mut(ws).push(node);
+        node
+    }
+
+    /// Switches a window between tiled and floating, keeping focus on it.
+    ///
+    /// A window floated for the first time is centred on its monitor at 60%
+    /// of the work area; after that it returns to where it last floated. A
+    /// window tiled again is placed by the workspace's layout as if new.
+    pub fn toggle_floating(&mut self, window: WindowId) -> bool {
+        let Some(node) = self.window_node(window) else {
+            return false;
+        };
+        let ws = self.workspace_of(node).expect("window outside a workspace");
+        if self.node_is_floating(node) {
+            self.floating_nodes_mut(ws).retain(|&n| n != node);
+            self.node_mut(node).parent = None;
+            self.set_node_floating(node, false);
+            // Manual layout inserts beside the focused window; that's this
+            // one, which is no longer in the tree, so append instead.
+            self.set_workspace_focus(ws, None);
+            self.layout_insert(ws, node);
+        } else {
+            let area = self.monitor_work_area(self.monitor_of(ws));
+            let rect = self.float_rect(window).unwrap_or_else(|| {
+                let (w, h) = (area.width * 3 / 5, area.height * 3 / 5);
+                Rect::new(
+                    area.x + (area.width - w) / 2,
+                    area.y + (area.height - h) / 2,
+                    w,
+                    h,
+                )
+            });
+            self.unlink_window(node);
+            self.set_node_floating(node, true);
+            self.set_float_rect(window, rect);
+            self.node_mut(node).parent = Some(ws);
+            self.floating_nodes_mut(ws).push(node);
+        }
+        self.set_workspace_focus(ws, Some(node));
+        true
     }
 
     /// Removes a window, tidies up the tree around it and, if it was focused,
@@ -379,6 +514,15 @@ impl Tree {
     /// focus to its nearest sibling. Returns the workspace it left.
     fn unlink_window(&mut self, node: NodeId) -> NodeId {
         let ws = self.workspace_of(node).expect("window outside a workspace");
+        if self.node_is_floating(node) {
+            self.floating_nodes_mut(ws).retain(|&n| n != node);
+            self.node_mut(node).parent = None;
+            if self.workspace_focus(ws) == Some(node) {
+                let next = self.fallback_focus(ws);
+                self.set_workspace_focus(ws, next);
+            }
+            return ws;
+        }
         let (parent, idx) = self.index_in_parent(node);
 
         let next_focus = (self.workspace_focus(ws) == Some(node)).then(|| {
@@ -398,10 +542,17 @@ impl Tree {
         if let Some(next) = next_focus {
             // A window was the only child of its split: fall back to anything
             // left in the workspace.
-            let next = next.or_else(|| self.first_window(ws));
+            let next = next.or_else(|| self.fallback_focus(ws));
             self.set_workspace_focus(ws, next);
         }
         ws
+    }
+
+    /// Something in `ws` to focus when nothing nearer applies: the first
+    /// tiled window, else the newest floating one.
+    fn fallback_focus(&self, ws: NodeId) -> Option<NodeId> {
+        self.first_window(ws)
+            .or_else(|| self.floating_nodes(ws).last().copied())
     }
 
     /// Sends a window to another workspace, placed by that workspace's
@@ -414,8 +565,23 @@ impl Tree {
         if source == target {
             return None;
         }
+        let floating = self.node_is_floating(node);
         self.unlink_window(node);
-        self.layout_insert(target, node);
+        if floating {
+            // Keep its position relative to the monitor, nudged back inside
+            // if the target monitor is smaller.
+            let from = self.monitor_work_area(self.monitor_of(source));
+            let to = self.monitor_work_area(self.monitor_of(target));
+            if let Some(r) = self.float_rect(window) {
+                let x = to.x + (r.x - from.x).clamp(0, (to.width - r.width).max(0));
+                let y = to.y + (r.y - from.y).clamp(0, (to.height - r.height).max(0));
+                self.set_float_rect(window, Rect::new(x, y, r.width, r.height));
+            }
+            self.node_mut(node).parent = Some(target);
+            self.floating_nodes_mut(target).push(node);
+        } else {
+            self.layout_insert(target, node);
+        }
         if self.workspace_focus(target).is_none() {
             self.set_workspace_focus(target, Some(node));
         }
@@ -432,11 +598,15 @@ impl Tree {
     ///    there is none, re-orient the workspace so the window can sit
     ///    beside everything else.
     ///
-    /// The window keeps focus. Returns `false` if nothing moved.
+    /// The window keeps focus. Returns `false` if nothing moved, which is
+    /// always the case for floating windows.
     pub fn move_in_direction(&mut self, window: WindowId, direction: Direction) -> bool {
         let Some(node) = self.window_node(window) else {
             return false;
         };
+        if self.node_is_floating(node) {
+            return false;
+        }
         let axis = direction.axis();
         let forward = matches!(direction, Direction::Right | Direction::Down);
 
@@ -589,7 +759,10 @@ impl Tree {
     /// placed along `axis`. If `window` is its container's only child, the
     /// container is simply re-oriented; otherwise it's wrapped in a new split.
     pub fn split(&mut self, window: WindowId, axis: Axis) -> bool {
-        let Some(node) = self.window_node(window) else {
+        let Some(node) = self
+            .window_node(window)
+            .filter(|&n| !self.node_is_floating(n))
+        else {
             return false;
         };
         let (parent, idx) = self.index_in_parent(node);
@@ -615,7 +788,10 @@ impl Tree {
     /// Splits `window` along the opposite axis to its current container, so
     /// one key alternates between side-by-side and stacked.
     pub fn toggle_split(&mut self, window: WindowId) -> bool {
-        let Some(node) = self.window_node(window) else {
+        let Some(node) = self
+            .window_node(window)
+            .filter(|&n| !self.node_is_floating(n))
+        else {
             return false;
         };
         let parent = self.node(node).parent.expect("window has no parent");
@@ -629,7 +805,10 @@ impl Tree {
     /// share from its siblings in the nearest container laid out on that axis.
     /// `delta` is a fraction of that container, e.g. `0.05` for 5%.
     pub fn resize(&mut self, window: WindowId, axis: Axis, delta: f64) -> bool {
-        let Some(mut child) = self.window_node(window) else {
+        let Some(mut child) = self
+            .window_node(window)
+            .filter(|&n| !self.node_is_floating(n))
+        else {
             return false;
         };
         loop {
@@ -676,7 +855,7 @@ impl Tree {
 
     fn arrange_node(&self, node: NodeId, rect: Rect, inner: i32, out: &mut Vec<(WindowId, Rect)>) {
         let n = self.node(node);
-        if let NodeKind::Window { id } = n.kind {
+        if let NodeKind::Window { id, .. } = n.kind {
             out.push((id, rect));
             return;
         }
@@ -730,11 +909,22 @@ impl Tree {
         let rects = self.arrange(ws, Gaps::default());
         let current = self.workspace_focus(ws).map(|n| self.window_id(n));
 
-        // Start from the focused window, or the whole monitor if it's empty.
-        let from = match current.and_then(|c| rects.iter().find(|(id, _)| *id == c)) {
-            Some(&(_, rect)) => rect,
-            None => self.monitor_work_area(monitor),
-        };
+        // Start from the focused window (tiled or floating), or the whole
+        // monitor if nothing is focused. Only tiled windows are targets.
+        let from = current
+            .and_then(|c| {
+                rects
+                    .iter()
+                    .find(|(id, _)| *id == c)
+                    .map(|&(_, r)| r)
+                    // A floating window usually overlaps tiles on every
+                    // side, so start from its centre point instead.
+                    .or_else(|| {
+                        let (x, y) = self.float_rect(c)?.center();
+                        Some(Rect::new(x, y, 0, 0))
+                    })
+            })
+            .unwrap_or_else(|| self.monitor_work_area(monitor));
 
         if let Some(current) = current {
             let others = rects.iter().copied().filter(|&(id, _)| id != current);
@@ -915,7 +1105,7 @@ impl Tree {
     pub fn debug_layout(&self, node: NodeId) -> String {
         let n = self.node(node);
         match n.kind {
-            NodeKind::Window { id } => id.0.to_string(),
+            NodeKind::Window { id, .. } => id.0.to_string(),
             _ => {
                 let axis = match self.container_axis(node) {
                     Some(Axis::Horizontal) => "H",
@@ -923,7 +1113,13 @@ impl Tree {
                     None => "?",
                 };
                 let inner: Vec<_> = n.children.iter().map(|&c| self.debug_layout(c)).collect();
-                format!("{axis}[{}]", inner.join(" "))
+                let mut out = format!("{axis}[{}]", inner.join(" "));
+                let floating = self.floating_nodes(node);
+                if !floating.is_empty() {
+                    let ids: Vec<_> = floating.iter().map(|&f| self.debug_layout(f)).collect();
+                    out += &format!(" F[{}]", ids.join(" "));
+                }
+                out
             }
         }
     }
@@ -1453,6 +1649,108 @@ mod tests {
         assert_eq!(tree.monitor_by_id(MonitorId(2)), Some(tree.monitor_of(ws2)));
         assert_eq!(tree.monitor_by_id(MonitorId(1)), Some(tree.monitor_of(ws1)));
         assert_eq!(tree.monitor_by_id(MonitorId(9)), None);
+    }
+
+    #[test]
+    fn floating_windows_sit_outside_the_tiling_tree() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1]);
+        tree.insert_floating(ws, w(2), Rect::new(10, 10, 100, 100));
+        assert_eq!(tree.debug_layout(ws), "H[1] F[2]");
+        assert_eq!(tree.arrange(ws, Gaps::default()).len(), 1);
+        assert_eq!(tree.workspace_windows(ws), [w(1), w(2)]);
+        assert_eq!(
+            tree.floating_windows(ws),
+            [(w(2), Rect::new(10, 10, 100, 100))]
+        );
+        assert!(tree.is_floating(w(2)));
+        assert!(!tree.is_floating(w(1)));
+    }
+
+    #[test]
+    fn toggle_floating_round_trip() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2, 3]);
+        tree.focus_window(w(2));
+
+        assert!(tree.toggle_floating(w(2)));
+        assert_eq!(tree.debug_layout(ws), "H[1 3] F[2]");
+        assert_eq!(tree.focused_window(), Some(w(2)));
+        // First float: centred at 60% of the 1000x500 work area.
+        assert_eq!(tree.float_rect(w(2)), Some(Rect::new(200, 100, 600, 300)));
+        weights_sum_to_one(&tree, ws);
+
+        tree.set_float_rect(w(2), Rect::new(50, 60, 300, 200));
+        assert!(tree.toggle_floating(w(2)));
+        assert_eq!(tree.debug_layout(ws), "H[1 3 2]");
+        assert_eq!(tree.focused_window(), Some(w(2)));
+        weights_sum_to_one(&tree, ws);
+
+        // Floating again returns to where it was last dragged.
+        tree.toggle_floating(w(2));
+        assert_eq!(tree.float_rect(w(2)), Some(Rect::new(50, 60, 300, 200)));
+    }
+
+    #[test]
+    fn removing_focused_float_falls_back_to_tiles() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        tree.insert_floating(ws, w(3), Rect::new(0, 0, 10, 10));
+        tree.focus_window(w(3));
+        tree.remove_window(w(3));
+        assert_eq!(tree.focused_window(), Some(w(1)));
+
+        // And a lone float is the fallback when the last tile goes.
+        tree.insert_floating(ws, w(4), Rect::new(0, 0, 10, 10));
+        tree.remove_window(w(1));
+        tree.remove_window(w(2));
+        assert_eq!(tree.focused_window(), Some(w(4)));
+    }
+
+    #[test]
+    fn new_tile_appends_when_a_float_has_focus() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        tree.focus_window(w(1));
+        tree.insert_floating(ws, w(3), Rect::new(0, 0, 10, 10));
+        tree.focus_window(w(3));
+        open(&mut tree, ws, &[4]);
+        assert_eq!(tree.debug_layout(ws), "H[1 2 4] F[3]");
+    }
+
+    #[test]
+    fn tiling_operations_ignore_floats() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1]);
+        tree.insert_floating(ws, w(2), Rect::new(0, 0, 10, 10));
+        assert!(!tree.move_in_direction(w(2), Direction::Right));
+        assert!(!tree.split(w(2), Axis::Vertical));
+        assert!(!tree.toggle_split(w(2)));
+        assert!(!tree.resize(w(2), Axis::Horizontal, 0.1));
+        assert_eq!(tree.debug_layout(ws), "H[1] F[2]");
+    }
+
+    #[test]
+    fn directional_focus_from_float_uses_its_centre() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        tree.insert_floating(ws, w(3), Rect::new(200, 100, 600, 300));
+        tree.focus_window(w(3));
+        assert_eq!(tree.focus_in_direction(Direction::Right), Some(w(2)));
+        tree.focus_window(w(3));
+        assert_eq!(tree.focus_in_direction(Direction::Left), Some(w(1)));
+    }
+
+    #[test]
+    fn floats_keep_relative_position_across_monitors() {
+        let (mut tree, ws1, ws2) = setup_dual();
+        open(&mut tree, ws1, &[1]);
+        tree.insert_floating(ws1, w(2), Rect::new(900, 100, 200, 100));
+        assert_eq!(tree.move_window_to_workspace(w(2), ws2), Some(ws1));
+        assert_eq!(tree.debug_layout(ws2), "H[] F[2]");
+        // x clamped so it fits the narrower monitor; y kept relative.
+        assert_eq!(tree.float_rect(w(2)), Some(Rect::new(1600, 70, 200, 100)));
+        assert!(tree.is_floating(w(2)));
     }
 
     #[test]

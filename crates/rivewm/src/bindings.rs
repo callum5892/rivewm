@@ -27,6 +27,7 @@ pub fn defaults() -> Vec<(String, Command)> {
         ("alt+shift+up", Move(Up)),
         ("alt+shift+right", Move(Right)),
         ("alt+v", ToggleSplit),
+        ("alt+shift+space", ToggleFloating),
         ("alt+ctrl+l", resize(Axis::Horizontal, RESIZE_STEP)),
         ("alt+ctrl+h", resize(Axis::Horizontal, -RESIZE_STEP)),
         ("alt+ctrl+j", resize(Axis::Vertical, RESIZE_STEP)),

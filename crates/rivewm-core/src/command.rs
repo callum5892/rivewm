@@ -16,6 +16,8 @@ pub enum Command {
     Split(Axis),
     /// Like `Split`, using the opposite axis of the focused window's container.
     ToggleSplit,
+    /// Switch the focused window between tiled and floating.
+    ToggleFloating,
     /// Grow (positive) or shrink the focused window by a fraction of its
     /// container.
     Resize {
