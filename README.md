@@ -45,13 +45,18 @@ Alt+Tab.
 
 ## Install
 
-From a clone of this repository:
+```
+cargo install --git https://github.com/callum5892/rivewm rivewm
+```
+
+Or from a clone of this repository:
 
 ```
 cargo install --path crates/rivewm
 ```
 
-This puts `rivewm.exe` in `~\.cargo\bin`, which rustup adds to your `PATH`.
+Either puts `rivewm.exe` in `~\.cargo\bin`, which rustup adds to your
+`PATH`.
 
 ## Running
 
@@ -162,9 +167,12 @@ Any command above works over IPC. `query state` and `subscribe` are enough to
 build a status bar or let an AI agent arrange your windows. The protocol and
 event list are in [docs/IPC.md](docs/IPC.md).
 
-rivewm has no built-in status bar. Any bar that registers as a Windows app
-bar (like [YASB](https://github.com/amnweb/yasb)) gets its space respected
-automatically, and can show rivewm's workspaces through the IPC.
+rivewm has no built-in status bar. [rivewm-bar](https://github.com/callum5892/rivewm-bar)
+is a simple one built on this IPC: it shows each monitor's workspaces, the
+focused window's title and a clock. Any other bar that registers as a
+Windows app bar (like [YASB](https://github.com/amnweb/yasb)) also gets its
+space respected automatically, and can show rivewm's workspaces through the
+IPC.
 
 ## How it works
 
