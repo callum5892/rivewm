@@ -41,6 +41,9 @@ pub struct Wm {
     refused: RefCell<Vec<WindowId>>,
     /// Windows released for that reason, so they aren't managed again.
     unmovable: HashSet<WindowId>,
+    /// The window being dragged and its frame when the drag began, to tell
+    /// a move from a resize when it ends.
+    drag_start: Option<(WindowId, Rect)>,
 }
 
 /// Where a dragged tiled window was dropped.
@@ -68,6 +71,7 @@ impl Wm {
             fullscreen: BTreeSet::new(),
             refused: RefCell::new(Vec::new()),
             unmovable: HashSet::new(),
+            drag_start: None,
         }
     }
 
@@ -290,7 +294,10 @@ impl Wm {
                 self.tiled_dropped(id);
             }
             WindowEvent::MoveSizeEnded(_) => {}
-            WindowEvent::MoveSizeStarted(_) | WindowEvent::LocationChanged(_) => {}
+            WindowEvent::MoveSizeStarted(id) => {
+                self.drag_start = rivewm_platform::query_window(id).map(|w| (id, w.frame));
+            }
+            WindowEvent::LocationChanged(_) => {}
         }
     }
 
@@ -408,26 +415,57 @@ impl Wm {
         }
     }
 
-    /// The user let go of a tiled window after dragging it. Moving it puts it
-    /// beside whichever tile the cursor is over, on the side the cursor is
-    /// nearest (or onto an empty monitor). Anything else, including
-    /// dropping it back on its own tile or resizing it by an edge, snaps it
-    /// back into place.
+    /// The user let go of a tiled window after dragging it.
+    ///
+    /// - Dragged by an edge or corner: the boundary at each edge that moved
+    ///   follows it, so the neighbours across those edges resize to match.
+    /// - Moved: it goes beside whichever tile the cursor is over, on the
+    ///   side the cursor is nearest (or onto an empty monitor).
+    ///
+    /// Anything that can't be honoured (dropped back on its own tile, an
+    /// edge against the monitor's edge) snaps back into place.
     fn tiled_dropped(&mut self, id: WindowId) {
-        let tile = self.workspace_of(id).and_then(|ws| {
-            let rects = self.tree.arrange(ws, self.config.gaps);
-            rects.into_iter().find(|&(w, _)| w == id).map(|(_, r)| r)
-        });
-        let frame = rivewm_platform::query_window(id).map(|w| w.frame);
-        // Mouse resizing isn't supported yet; a few pixels of slack allow
-        // for rounding.
-        let resized = match (tile, frame) {
-            (Some(tile), Some(frame)) => {
-                (frame.width - tile.width).abs() > 4 || (frame.height - tile.height).abs() > 4
-            }
-            _ => true,
+        let Some(ws) = self.workspace_of(id) else {
+            return;
         };
-        if !resized && let Some((x, y)) = rivewm_platform::cursor_position() {
+        let tile = self
+            .tree
+            .arrange(ws, self.config.gaps)
+            .into_iter()
+            .find(|&(w, _)| w == id)
+            .map(|(_, r)| r);
+        let frame = rivewm_platform::query_window(id).map(|w| w.frame);
+        // Compare with the frame when the drag began rather than the tile:
+        // apps with a minimum size bigger than their tile never match it.
+        let start = match self.drag_start.take() {
+            Some((w, start)) if w == id => Some(start),
+            _ => tile,
+        };
+        let (Some(start), Some(frame)) = (start, frame) else {
+            self.apply_all();
+            return;
+        };
+
+        // A few pixels of slack absorb rounding in the frame measurements.
+        const SLACK: i32 = 4;
+        let resized = (frame.width - start.width).abs() > SLACK
+            || (frame.height - start.height).abs() > SLACK;
+        if resized {
+            if self.tree.fullscreen_window(ws) != Some(id) {
+                // How far each edge moved outwards.
+                let edges = [
+                    (Direction::Left, start.x - frame.x),
+                    (Direction::Right, frame.right() - start.right()),
+                    (Direction::Up, start.y - frame.y),
+                    (Direction::Down, frame.bottom() - start.bottom()),
+                ];
+                for (side, grow) in edges {
+                    if grow.abs() > SLACK {
+                        self.tree.resize_edge(id, side, grow, self.config.gaps);
+                    }
+                }
+            }
+        } else if let Some((x, y)) = rivewm_platform::cursor_position() {
             match self.drop_target(x, y) {
                 Some(Drop::Beside(target, side)) if self.tree.move_beside(id, target, side) => {
                     info!(

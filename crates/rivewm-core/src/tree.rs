@@ -1162,6 +1162,72 @@ impl Tree {
         }
     }
 
+    /// Moves one edge of a tiled window by `grow` pixels, like dragging a
+    /// normal window's edge: positive grows the window outwards on `side`,
+    /// negative shrinks it. Only the boundary at that edge moves, so only
+    /// the neighbour across it gives up or gains space. If the window shares
+    /// that edge with its whole split (e.g. the right edge of a stacked
+    /// column), the split's boundary moves instead.
+    ///
+    /// Returns `false` if nothing lies across that edge (it's the monitor's).
+    pub fn resize_edge(
+        &mut self,
+        window: WindowId,
+        side: Direction,
+        grow: i32,
+        gaps: Gaps,
+    ) -> bool {
+        let Some(node) = self
+            .window_node(window)
+            .filter(|&n| !self.node_is_floating(n))
+        else {
+            return false;
+        };
+        if grow == 0 {
+            return false;
+        }
+        let ws = self.workspace_of(node).expect("window outside a workspace");
+        let rects = self.node_rects(ws, gaps);
+        let axis = side.axis();
+        let forward = matches!(side, Direction::Right | Direction::Down);
+
+        let mut child = node;
+        while child != ws {
+            let (parent, idx) = self.index_in_parent(child);
+            if self.container_axis(parent) == Some(axis) {
+                let across = if forward {
+                    Some(idx + 1)
+                } else {
+                    idx.checked_sub(1)
+                };
+                if let Some(&neighbour) = across.and_then(|i| self.node(parent).children.get(i)) {
+                    let children = &self.node(parent).children;
+                    let rect = rects[&parent];
+                    let along = match axis {
+                        Axis::Horizontal => rect.width,
+                        Axis::Vertical => rect.height,
+                    };
+                    let space = along - gaps.inner * (children.len() as i32 - 1);
+                    if space <= 0 {
+                        return false;
+                    }
+                    let total: f64 = children.iter().map(|&c| self.node(c).weight).sum();
+                    let (mine, theirs) = (self.node(child).weight, self.node(neighbour).weight);
+                    // Neither side may shrink below the minimum. The bounds
+                    // always straddle zero, which `clamp` requires.
+                    let lowest = (MIN_WEIGHT * total - mine).min(0.0);
+                    let highest = (theirs - MIN_WEIGHT * total).max(0.0);
+                    let delta = (grow as f64 / space as f64 * total).clamp(lowest, highest);
+                    self.node_mut(child).weight += delta;
+                    self.node_mut(neighbour).weight -= delta;
+                    return true;
+                }
+            }
+            child = parent;
+        }
+        false
+    }
+
     fn adjust_weight(&mut self, child: NodeId, delta: f64) {
         let parent = self.node(child).parent.expect("child without parent");
         let n = self.node(parent).children.len() as f64;
@@ -1201,11 +1267,37 @@ impl Tree {
     }
 
     fn arrange_node(&self, node: NodeId, rect: Rect, inner: i32, out: &mut Vec<(WindowId, Rect)>) {
+        self.layout_node(node, rect, inner, &mut |n, r| {
+            if let NodeKind::Window { id, .. } = self.node(n).kind {
+                out.push((id, r));
+            }
+        });
+    }
+
+    /// Rects of every node in a workspace's tiling tree, containers
+    /// included (no fullscreen override).
+    fn node_rects(&self, ws: NodeId, gaps: Gaps) -> HashMap<NodeId, Rect> {
+        let area = self
+            .monitor_work_area(self.monitor_of(ws))
+            .inset(gaps.outer);
+        let mut rects = HashMap::new();
+        self.layout_node(ws, area, gaps.inner, &mut |n, r| {
+            rects.insert(n, r);
+        });
+        rects
+    }
+
+    /// Lays out `node` in `rect`, calling `visit` for it and everything
+    /// below it.
+    fn layout_node(
+        &self,
+        node: NodeId,
+        rect: Rect,
+        inner: i32,
+        visit: &mut impl FnMut(NodeId, Rect),
+    ) {
+        visit(node, rect);
         let n = self.node(node);
-        if let NodeKind::Window { id, .. } = n.kind {
-            out.push((id, rect));
-            return;
-        }
         let Some(axis) = self.container_axis(node) else {
             return;
         };
@@ -1236,7 +1328,7 @@ impl Tree {
                 Axis::Horizontal => Rect::new(rect.x + offset, rect.y, end - start, rect.height),
                 Axis::Vertical => Rect::new(rect.x, rect.y + offset, rect.width, end - start),
             };
-            self.arrange_node(child, child_rect, inner, out);
+            self.layout_node(child, child_rect, inner, visit);
             start = end;
         }
     }
@@ -2336,6 +2428,77 @@ mod tests {
         assert!(!tree.move_beside(w(3), w(1), Direction::Left));
         assert!(!tree.move_beside(w(1), w(3), Direction::Left));
         assert_eq!(tree.debug_layout(ws), "H[1 2] F[3]");
+    }
+
+    fn widths(tree: &Tree, ws: NodeId, gaps: Gaps) -> Vec<i32> {
+        tree.arrange(ws, gaps)
+            .iter()
+            .map(|(_, r)| r.width)
+            .collect()
+    }
+
+    #[test]
+    fn edge_resize_only_moves_the_neighbour_across_that_edge() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2, 3]);
+        assert_eq!(widths(&tree, ws, Gaps::default()), [333, 334, 333]);
+
+        // Drag 1's right edge 100px right: 2 shrinks, 3 doesn't move.
+        assert!(tree.resize_edge(w(1), Direction::Right, 100, Gaps::default()));
+        assert_eq!(widths(&tree, ws, Gaps::default()), [433, 234, 333]);
+
+        // Drag 3's left edge 50px left: 2 shrinks again, 1 doesn't move.
+        assert!(tree.resize_edge(w(3), Direction::Left, 50, Gaps::default()));
+        assert_eq!(widths(&tree, ws, Gaps::default()), [433, 184, 383]);
+        weights_sum_to_one(&tree, ws);
+    }
+
+    #[test]
+    fn edge_resize_climbs_to_the_split_that_owns_the_edge() {
+        // H[1 V[2 3]]: 3's left edge is the boundary between 1 and the V.
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        tree.split(w(2), Axis::Vertical);
+        open(&mut tree, ws, &[3]);
+        assert!(tree.resize_edge(w(3), Direction::Left, 100, Gaps::default()));
+        let rects = tree.arrange(ws, Gaps::default());
+        assert_eq!(rects[0].1.width, 400);
+        assert_eq!(rects[1].1.width, 600);
+        assert_eq!(rects[2].1.width, 600);
+
+        // Its top edge is the boundary with 2, inside the V.
+        assert!(tree.resize_edge(w(3), Direction::Up, 50, Gaps::default()));
+        let rects = tree.arrange(ws, Gaps::default());
+        assert_eq!((rects[1].1.height, rects[2].1.height), (200, 300));
+    }
+
+    #[test]
+    fn edge_resize_at_monitor_edge_does_nothing() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        assert!(!tree.resize_edge(w(1), Direction::Left, 50, Gaps::default()));
+        assert!(!tree.resize_edge(w(1), Direction::Up, 50, Gaps::default()));
+        assert!(!tree.resize_edge(w(2), Direction::Right, 50, Gaps::default()));
+        assert_eq!(widths(&tree, ws, Gaps::default()), [500, 500]);
+    }
+
+    #[test]
+    fn edge_resize_is_pixel_accurate_with_gaps_and_clamped() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        let gaps = Gaps {
+            inner: 10,
+            outer: 0,
+        };
+        assert_eq!(widths(&tree, ws, gaps), [495, 495]);
+        assert!(tree.resize_edge(w(1), Direction::Right, 99, gaps));
+        assert_eq!(widths(&tree, ws, gaps), [594, 396]);
+
+        // Can't squeeze either side below 5% of the 990px they share.
+        tree.resize_edge(w(1), Direction::Right, 5000, gaps);
+        assert_eq!(widths(&tree, ws, gaps), [941, 49]);
+        tree.resize_edge(w(1), Direction::Right, -5000, gaps);
+        assert_eq!(widths(&tree, ws, gaps), [50, 940]);
     }
 
     #[test]
