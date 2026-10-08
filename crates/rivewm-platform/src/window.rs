@@ -7,10 +7,11 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetWindow, GetWindowLongPtrW,
-    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_THICKFRAME,
+    EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetForegroundWindow, GetWindow,
+    GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, IsZoomed, SW_RESTORE, SW_SHOWNA, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
+    SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
 use windows::core::BOOL;
 
@@ -94,9 +95,64 @@ unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     true.into()
 }
 
+fn hwnd(id: WindowId) -> HWND {
+    HWND(id.0 as *mut c_void)
+}
+
+/// The window that currently has keyboard focus, if any.
+pub fn foreground_window() -> Option<WindowId> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    (!hwnd.is_invalid()).then_some(WindowId(hwnd.0 as isize))
+}
+
+/// Positions a window so its *visible* frame lands exactly on `frame`.
+///
+/// Most windows have invisible resize borders that `SetWindowPos` counts as
+/// part of the window; we measure them and add them back. Maximized windows
+/// are restored first, since Windows ignores moves while maximized.
+///
+/// Uses `SWP_ASYNCWINDOWPOS` so a hung application can't block the WM.
+pub fn set_frame(id: WindowId, frame: Rect) -> windows::core::Result<()> {
+    let hwnd = hwnd(id);
+    unsafe {
+        if IsZoomed(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+    }
+    let outer = window_rect(hwnd).unwrap_or(frame);
+    let visible = extended_frame_bounds(hwnd).unwrap_or(outer);
+    let (left, top) = (visible.x - outer.x, visible.y - outer.y);
+    let (right, bottom) = (
+        outer.right() - visible.right(),
+        outer.bottom() - visible.bottom(),
+    );
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            frame.x - left,
+            frame.y - top,
+            frame.width + left + right,
+            frame.height + top + bottom,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS,
+        )
+    }
+}
+
+/// Makes a window visible again without activating it. Used to undo any
+/// hiding on shutdown.
+pub fn show_window(id: WindowId) {
+    let hwnd = hwnd(id);
+    unsafe {
+        if IsWindow(Some(hwnd)).as_bool() && !IsWindowVisible(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_SHOWNA);
+        }
+    }
+}
+
 /// Looks up a single window. Returns `None` if it no longer exists.
 pub fn query_window(id: WindowId) -> Option<WindowInfo> {
-    let hwnd = HWND(id.0 as *mut c_void);
+    let hwnd = hwnd(id);
     unsafe { IsWindow(Some(hwnd)) }
         .as_bool()
         .then(|| window_info(hwnd))

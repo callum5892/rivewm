@@ -1,13 +1,17 @@
+mod wm;
+
 use std::collections::HashSet;
 
 use anyhow::{Context, Result, bail};
-use rivewm_core::{WindowEvent, WindowId};
+use rivewm_core::{Gaps, WindowEvent, WindowId};
 use tracing_subscriber::EnvFilter;
+use wm::Wm;
 
 const USAGE: &str = "\
 rivewm - a tiling window manager for Windows
 
 USAGE:
+    rivewm                   Run the window manager (Ctrl+C to quit)
     rivewm --list [--all]    List monitors and tileable windows
                              (--all also shows skipped windows and why)
     rivewm --events [--all]  Log window events live until Ctrl+C
@@ -26,12 +30,40 @@ fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("--list") => list(args.iter().any(|a| a == "--all")),
         Some("--events") => events(args.iter().any(|a| a == "--all")),
-        Some("--help" | "-h") | None => {
+        Some("--help" | "-h") => {
             print!("{USAGE}");
             Ok(())
         }
+        None => run(),
         Some(other) => bail!("unknown argument `{other}`\n\n{USAGE}"),
     }
+}
+
+fn run() -> Result<()> {
+    // Hooks first, so no window that opens during startup is missed.
+    let (_events, rx) = rivewm_platform::EventThread::spawn().context("failed to install hooks")?;
+
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        wm::restore_all();
+        default_hook(info);
+    }));
+    ctrlc::set_handler(|| {
+        tracing::info!("shutting down");
+        wm::restore_all();
+        std::process::exit(0);
+    })
+    .context("failed to install Ctrl+C handler")?;
+
+    let mut wm = Wm::new(Gaps { inner: 8, outer: 8 });
+    wm.manage_existing();
+    tracing::info!("rivewm running. Ctrl+C to quit.");
+
+    for event in rx {
+        wm.handle(event);
+    }
+    wm::restore_all();
+    Ok(())
 }
 
 fn list(all: bool) -> Result<()> {

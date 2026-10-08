@@ -13,7 +13,9 @@ mod window;
 
 pub use events::EventThread;
 pub use monitor::{MonitorInfo, monitors};
-pub use window::{Skip, WindowInfo, enumerate_windows, query_window};
+pub use window::{
+    Skip, WindowInfo, enumerate_windows, foreground_window, query_window, set_frame, show_window,
+};
 
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
