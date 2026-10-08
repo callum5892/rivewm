@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
-use rivewm_core::{Command, Gaps};
+use rivewm_core::{Command, Gaps, Layout};
 use rivewm_platform::{Hotkey, WindowInfo};
 use serde::Deserialize;
 use tracing::info;
@@ -21,6 +21,8 @@ pub struct Config {
     pub gaps: Gaps,
     /// Keep floating windows always on top.
     pub floating_on_top: bool,
+    /// Layout for newly created workspaces.
+    pub default_layout: Layout,
     pub bindings: Vec<(Hotkey, Command)>,
     pub rules: Vec<Rule>,
 }
@@ -94,6 +96,7 @@ pub fn load(path: &Path) -> Result<Config> {
 struct RawConfig {
     gaps: Option<RawGaps>,
     floating: Option<RawFloating>,
+    layout: Option<RawLayout>,
     keybindings: Option<BTreeMap<String, String>>,
     rules: Option<Vec<RawRule>>,
 }
@@ -103,6 +106,12 @@ struct RawConfig {
 struct RawGaps {
     inner: Option<i32>,
     outer: Option<i32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLayout {
+    default: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -139,6 +148,15 @@ pub fn parse(text: &str) -> Result<Config> {
         bail!("gaps can't be negative");
     }
 
+    let default_layout: Layout = user
+        .layout
+        .and_then(|l| l.default)
+        .or(defaults.layout.and_then(|l| l.default))
+        .unwrap_or_default()
+        .parse()
+        .map_err(anyhow::Error::msg)
+        .context("in [layout]")?;
+
     let floating_on_top = user
         .floating
         .and_then(|f| f.on_top)
@@ -170,6 +188,7 @@ pub fn parse(text: &str) -> Result<Config> {
     Ok(Config {
         gaps,
         floating_on_top,
+        default_layout,
         bindings,
         rules,
     })
@@ -223,6 +242,7 @@ mod tests {
         assert_eq!(config.gaps, Gaps { inner: 8, outer: 8 });
         assert!(config.rules.is_empty());
         assert!(!config.floating_on_top);
+        assert_eq!(config.default_layout, Layout::Dwindle);
         let focus_left = "alt+h".parse::<Hotkey>().unwrap();
         assert!(
             config
@@ -237,6 +257,14 @@ mod tests {
         let config = parse("[gaps]\ninner = 2\n").unwrap();
         assert_eq!(config.gaps, Gaps { inner: 2, outer: 8 });
         assert_eq!(config.bindings.len(), 48);
+    }
+
+    #[test]
+    fn layout_option() {
+        let manual = parse("[layout]\ndefault = \"manual\"").unwrap();
+        assert_eq!(manual.default_layout, Layout::Manual);
+        let err = format!("{:#}", parse("[layout]\ndefault = \"spiral\"").unwrap_err());
+        assert!(err.contains("spiral"));
     }
 
     #[test]

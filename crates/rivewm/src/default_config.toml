@@ -9,6 +9,16 @@ inner = 8
 # Space between windows and the edge of the screen (not counting the taskbar).
 outer = 8
 
+[layout]
+# How new windows are placed on new workspaces:
+#   "dwindle"  Hyprland style: each new window takes half of the focused one,
+#              side by side if it's wider than tall, stacked otherwise.
+#              toggle-split flips the focused window's split right away.
+#   "manual"   i3 style: new windows open beside the focused one, in the
+#              direction you last picked with toggle-split.
+# Change the focused workspace's layout any time with the `layout` command.
+default = "dwindle"
+
 [floating]
 # Keep floating windows (dialogs, picture-in-picture, anything toggled with
 # toggle-floating) above tiled windows. Uses Windows' "always on top", so
@@ -26,6 +36,7 @@ on_top = false
 #   workspace <name>                move-to-workspace <name>
 #   split <horizontal|vertical>     toggle-split
 #   toggle-floating                 toggle-fullscreen
+#   layout <dwindle|manual>
 #   resize <width|height> <+N|-N>   (percent of the containing split)
 #   retile                          reload-config
 #   quit

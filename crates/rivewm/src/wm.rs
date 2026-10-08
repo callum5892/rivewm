@@ -50,9 +50,10 @@ impl Wm {
     /// (the primary monitor gets "1").
     pub fn new(config: Config) -> Self {
         let mut tree = Tree::new();
+        tree.set_default_layout(config.default_layout);
         for (i, spec) in monitor_specs().iter().enumerate() {
             let monitor = tree.add_monitor(spec);
-            tree.add_workspace(monitor, (i + 1).to_string(), Layout::Manual);
+            tree.add_workspace(monitor, (i + 1).to_string(), config.default_layout);
             info!(device = spec.name, work_area = %spec.work_area, "added monitor");
         }
         Self {
@@ -106,6 +107,7 @@ impl Wm {
     /// apply immediately; rules apply to windows opened from now on.
     pub fn set_config(&mut self, config: Config) {
         self.config = config;
+        self.tree.set_default_layout(self.config.default_layout);
         let managed: Vec<_> = lock(&MANAGED).iter().copied().collect();
         for id in managed {
             self.sync_topmost(id);
@@ -185,8 +187,26 @@ impl Wm {
                 }
             }
             Command::ToggleSplit => {
-                if let Some(id) = focused {
-                    self.tree.toggle_split(id);
+                let ws = focused.and_then(|id| self.workspace_of(id));
+                if let (Some(id), Some(ws)) = (focused, ws) {
+                    match self.tree.workspace_layout(ws) {
+                        // Affects where the next window opens.
+                        Layout::Manual => {
+                            self.tree.toggle_split(id);
+                        }
+                        // Hyprland's togglesplit: flips the split right away.
+                        Layout::Dwindle => {
+                            if self.tree.flip_split(id) {
+                                self.apply(ws);
+                            }
+                        }
+                    }
+                }
+            }
+            Command::SetLayout(layout) => {
+                if let Some(ws) = self.tree.focused_workspace() {
+                    self.tree.set_workspace_layout(ws, layout);
+                    info!(workspace = self.tree.workspace_name(ws), %layout, "layout set");
                 }
             }
             Command::ToggleFloating => {
@@ -502,7 +522,8 @@ impl Wm {
             Some(ws) => self.tree.monitor_of(ws),
             None => self.tree.monitors().next().expect("no monitors"),
         };
-        self.tree.add_workspace(monitor, name, Layout::Manual)
+        self.tree
+            .add_workspace(monitor, name, self.config.default_layout)
     }
 
     /// Deletes a workspace once it's empty and no longer shown.
@@ -609,7 +630,7 @@ impl Wm {
         json!({
             "name": self.tree.workspace_name(ws),
             "visible": self.tree.is_workspace_active(ws),
-            "layout": format!("{:?}", self.tree.workspace_layout(ws)).to_lowercase(),
+            "layout": self.tree.workspace_layout(ws).to_string(),
             "focused_window": self.tree.workspace_focused_window(ws).map(|w| w.0),
             "tiling": self.tiling_json(ws, &rects),
             "floating": floating,

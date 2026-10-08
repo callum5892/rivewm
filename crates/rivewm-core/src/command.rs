@@ -1,7 +1,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::{Axis, Direction, WindowId};
+use crate::{Axis, Direction, Layout, WindowId};
 
 /// Something the user asked the WM to do. Hotkeys, and later the CLI and
 /// IPC, all produce these.
@@ -19,6 +19,7 @@ use crate::{Axis, Direction, WindowId};
 /// | `toggle-split`                    | `ToggleSplit`                 |
 /// | `toggle-floating`                 | `ToggleFloating`              |
 /// | `toggle-fullscreen`               | `ToggleFullscreen`            |
+/// | `layout dwindle`                  | `SetLayout(Dwindle)`          |
 /// | `resize width +5`                 | grow width by 5% of container |
 /// | `resize height -5`                | shrink height by 5%           |
 /// | `retile`, `reload-config`, `quit` | as named                      |
@@ -44,6 +45,8 @@ pub enum Command {
     /// Make the focused window cover its whole monitor, or return it to
     /// normal.
     ToggleFullscreen,
+    /// Change how new windows are placed on the focused workspace.
+    SetLayout(Layout),
     /// Grow (positive) or shrink the focused window by a fraction of its
     /// container.
     Resize {
@@ -93,6 +96,7 @@ impl FromStr for Command {
             Some("move") => Command::Move(direction(args(1)?[0])?),
             Some("workspace") => Command::Workspace(args(1)?[0].to_owned()),
             Some("move-to-workspace") => Command::MoveToWorkspace(args(1)?[0].to_owned()),
+            Some("layout") => Command::SetLayout(args(1)?[0].parse().map_err(|e: String| err(&e))?),
             Some("focus-window") => {
                 let id = args(1)?[0];
                 let parsed = match id.strip_prefix("0x") {
@@ -170,6 +174,8 @@ mod tests {
         assert_eq!(parse("toggle-split"), Command::ToggleSplit);
         assert_eq!(parse("toggle-floating"), Command::ToggleFloating);
         assert_eq!(parse("toggle-fullscreen"), Command::ToggleFullscreen);
+        assert_eq!(parse("layout dwindle"), Command::SetLayout(Layout::Dwindle));
+        assert_eq!(parse("layout manual"), Command::SetLayout(Layout::Manual));
         assert_eq!(
             parse("resize width +5"),
             Command::Resize {
@@ -200,6 +206,7 @@ mod tests {
             "focus left now",
             "workspace",
             "split diagonal",
+            "layout spiral",
             "resize width",
             "resize depth +5",
             "resize width lots",

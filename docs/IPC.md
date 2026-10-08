@@ -40,6 +40,8 @@ Any command from the config file's `[keybindings]` section:
 | `split <horizontal/vertical>` | Next window opens beside the focused one along that axis    |
 | `toggle-split`                | Same, alternating axis                                      |
 | `toggle-floating`             | Float or tile the focused window                            |
+| `toggle-fullscreen`           | Make the focused window cover its monitor, or undo it       |
+| `layout <dwindle/manual>`     | Change how new windows are placed on the focused workspace  |
 | `resize <width/height> <±N>`  | Grow/shrink the focused window by N% of its container       |
 | `retile`, `reload-config`, `quit` | As named                                                |
 

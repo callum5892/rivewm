@@ -129,6 +129,9 @@ pub struct Tree {
     root: NodeId,
     windows: HashMap<WindowId, NodeId>,
     focused_workspace: Option<NodeId>,
+    /// Layout for workspaces the tree creates itself (e.g. for a newly
+    /// connected monitor).
+    default_layout: Layout,
 }
 
 impl Default for Tree {
@@ -151,6 +154,7 @@ impl Tree {
             root: NodeId(0),
             windows: HashMap::new(),
             focused_workspace: None,
+            default_layout: Layout::default(),
         }
     }
 
@@ -311,6 +315,19 @@ impl Tree {
         }
     }
 
+    /// Sets the layout used for workspaces the tree creates on its own.
+    pub fn set_default_layout(&mut self, layout: Layout) {
+        self.default_layout = layout;
+    }
+
+    /// Changes how new windows are placed in `ws`. Windows already there
+    /// stay where they are.
+    pub fn set_workspace_layout(&mut self, ws: NodeId, new: Layout) {
+        if let NodeKind::Workspace { layout, .. } = &mut self.node_mut(ws).kind {
+            *layout = new;
+        }
+    }
+
     pub fn workspace_layout(&self, ws: NodeId) -> Layout {
         match self.node(ws).kind {
             NodeKind::Workspace { layout, .. } => layout,
@@ -323,6 +340,10 @@ impl Tree {
             NodeKind::Workspace { focus, .. } => focus,
             _ => None,
         }
+    }
+
+    pub(crate) fn window_id_of(&self, node: NodeId) -> WindowId {
+        self.window_id(node)
     }
 
     fn window_id(&self, node: NodeId) -> WindowId {
@@ -362,6 +383,12 @@ impl Tree {
                 _ => id = *self.node(id).children.first()?,
             }
         }
+    }
+
+    /// The last tiled window in `ws` in tree order: the innermost of a
+    /// dwindle spiral.
+    pub(crate) fn last_tiled_window(&self, ws: NodeId) -> Option<NodeId> {
+        self.last_window(ws)
     }
 
     fn last_window(&self, mut id: NodeId) -> Option<NodeId> {
@@ -527,7 +554,7 @@ impl Tree {
                     .map(|n: u32| n.to_string())
                     .find(|n| self.workspace_by_name(n).is_none())
                     .expect("some number is free");
-                self.add_workspace(monitor, name, Layout::default())
+                self.add_workspace(monitor, name, self.default_layout)
             }
         };
         if let NodeKind::Monitor {
@@ -1078,6 +1105,21 @@ impl Tree {
 
     /// Splits `window` along the opposite axis to its current container, so
     /// one key alternates between side-by-side and stacked.
+    /// Hyprland-style `togglesplit`: flips the container holding `window`
+    /// between side-by-side and stacked, right away.
+    pub fn flip_split(&mut self, window: WindowId) -> bool {
+        let Some(node) = self
+            .window_node(window)
+            .filter(|&n| !self.node_is_floating(n))
+        else {
+            return false;
+        };
+        let parent = self.node(node).parent.expect("window has no parent");
+        let axis = self.container_axis(parent).expect("parent is a container");
+        self.set_container_axis(parent, axis.flip());
+        true
+    }
+
     pub fn toggle_split(&mut self, window: WindowId) -> bool {
         let Some(node) = self
             .window_node(window)
