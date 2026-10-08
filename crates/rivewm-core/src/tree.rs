@@ -486,16 +486,63 @@ impl Tree {
         }
     }
 
-    /// Moves focus to the nearest window in `direction` within the focused
-    /// workspace, judged by on-screen position rather than tree structure so
-    /// it behaves the same under every layout. Returns the new focus.
+    /// Moves focus to the nearest window in `direction`, judged by on-screen
+    /// position rather than tree structure so it behaves the same under every
+    /// layout.
+    ///
+    /// If nothing lies that way in the focused workspace, focus crosses to
+    /// the active workspace of the next monitor in that direction, landing on
+    /// its window nearest the one we came from. Crossing to a monitor with no
+    /// windows still focuses its workspace (so new windows open there) but
+    /// returns `None`.
     pub fn focus_in_direction(&mut self, direction: Direction) -> Option<WindowId> {
         let ws = self.focused_workspace?;
-        let current = self.window_id(self.workspace_focus(ws)?);
+        let monitor = self.monitor_of(ws);
         let rects = self.arrange(ws, Gaps::default());
-        let target = neighbour(&rects, current, direction)?;
+        let current = self.workspace_focus(ws).map(|n| self.window_id(n));
+
+        // Start from the focused window, or the whole monitor if it's empty.
+        let from = match current.and_then(|c| rects.iter().find(|(id, _)| *id == c)) {
+            Some(&(_, rect)) => rect,
+            None => self.monitor_work_area(monitor),
+        };
+
+        if let Some(current) = current {
+            let others = rects.iter().copied().filter(|&(id, _)| id != current);
+            if let Some(target) = neighbour(from, others, direction) {
+                self.focus_window(target);
+                return Some(target);
+            }
+        }
+
+        let monitors = self.node(self.root).children.iter().copied();
+        let monitors = monitors
+            .filter(|&m| m != monitor)
+            .map(|m| (m, self.monitor_work_area(m)));
+        let next_monitor = neighbour(self.monitor_work_area(monitor), monitors, direction)?;
+        let NodeKind::Monitor {
+            active_workspace, ..
+        } = self.node(next_monitor).kind
+        else {
+            unreachable!("root child is not a monitor");
+        };
+        let next_ws = active_workspace?;
+        self.focus_workspace(next_ws);
+
+        // Odd monitor offsets can leave no window strictly in `direction`;
+        // fall back to the workspace's last focus, then its first window.
+        let target = neighbour(from, self.arrange(next_ws, Gaps::default()), direction)
+            .or_else(|| self.workspace_focus(next_ws).map(|n| self.window_id(n)))
+            .or_else(|| self.workspace_windows(next_ws).first().copied())?;
         self.focus_window(target);
         Some(target)
+    }
+
+    fn monitor_work_area(&self, monitor: NodeId) -> Rect {
+        match self.node(monitor).kind {
+            NodeKind::Monitor { work_area, .. } => work_area,
+            _ => panic!("{monitor:?} is not a monitor"),
+        }
     }
 
     // ---- Structural helpers ------------------------------------------------
@@ -644,21 +691,19 @@ impl Tree {
     }
 }
 
-/// Picks the window whose rect is the best neighbour of `current` in
-/// `direction`: it must lie entirely on that side; windows that overlap
-/// `current` on the perpendicular axis win, then the nearest, then the one
-/// best aligned with `current`'s centre.
-fn neighbour(
-    rects: &[(WindowId, Rect)],
-    current: WindowId,
+/// Picks the candidate whose rect is the best neighbour of `from` in
+/// `direction`: it must lie entirely on that side; candidates that overlap
+/// `from` on the perpendicular axis win, then the nearest, then the one best
+/// aligned with `from`'s centre. Ties go to the earliest candidate.
+fn neighbour<T: Copy>(
+    from: Rect,
+    candidates: impl IntoIterator<Item = (T, Rect)>,
     direction: Direction,
-) -> Option<WindowId> {
-    let &(_, from) = rects.iter().find(|(id, _)| *id == current)?;
+) -> Option<T> {
     let (cx, cy) = from.center();
-    rects
-        .iter()
-        .filter(|(id, _)| *id != current)
-        .filter_map(|&(id, r)| {
+    candidates
+        .into_iter()
+        .filter_map(|(id, r)| {
             let (distance, overlaps, (rx, ry)) = match direction {
                 Direction::Left => (
                     from.x - r.right(),
@@ -898,6 +943,75 @@ mod tests {
         assert_eq!(tree.focus_in_direction(Direction::Right), Some(w(2)));
         assert_eq!(tree.focus_in_direction(Direction::Down), Some(w(3)));
         assert_eq!(tree.focused_window(), Some(w(3)));
+    }
+
+    /// Two monitors side by side, the right one offset upwards like a real
+    /// mismatched desk setup.
+    fn setup_dual() -> (Tree, NodeId, NodeId) {
+        let mut tree = Tree::new();
+        let left = tree.add_monitor(MonitorId(1), Rect::new(0, 0, 1000, 500));
+        let right = tree.add_monitor(MonitorId(2), Rect::new(1000, -30, 800, 480));
+        let ws1 = tree.add_workspace(left, "1", Layout::Manual);
+        let ws2 = tree.add_workspace(right, "2", Layout::Manual);
+        (tree, ws1, ws2)
+    }
+
+    #[test]
+    fn focus_crosses_to_next_monitor() {
+        let (mut tree, ws1, ws2) = setup_dual();
+        open(&mut tree, ws1, &[1, 2]);
+        tree.focus_workspace(ws2);
+        open(&mut tree, ws2, &[3, 4]);
+        tree.focus_window(w(2));
+
+        assert_eq!(tree.focus_in_direction(Direction::Right), Some(w(3)));
+        assert_eq!(tree.focused_workspace(), Some(ws2));
+        assert_eq!(tree.focus_in_direction(Direction::Right), Some(w(4)));
+        assert_eq!(tree.focus_in_direction(Direction::Right), None);
+        assert_eq!(tree.focused_window(), Some(w(4)));
+
+        tree.focus_window(w(3));
+        assert_eq!(tree.focus_in_direction(Direction::Left), Some(w(2)));
+        assert_eq!(tree.focused_workspace(), Some(ws1));
+    }
+
+    #[test]
+    fn focus_crossing_picks_nearest_window_on_target_monitor() {
+        // Right monitor is stacked V[3 4]; from 1 (vertically centred at
+        // y=250) the lower window 4 (centre y=330) is better aligned than 3
+        // (centre y=90), and both overlap 1 vertically.
+        let (mut tree, ws1, ws2) = setup_dual();
+        open(&mut tree, ws1, &[1]);
+        tree.focus_workspace(ws2);
+        open(&mut tree, ws2, &[3]);
+        tree.split(w(3), Axis::Vertical);
+        open(&mut tree, ws2, &[4]);
+        tree.focus_window(w(1));
+        assert_eq!(tree.focus_in_direction(Direction::Right), Some(w(4)));
+    }
+
+    #[test]
+    fn focus_can_cross_to_and_from_empty_monitor() {
+        let (mut tree, ws1, ws2) = setup_dual();
+        open(&mut tree, ws1, &[1, 2]);
+
+        // Into the empty monitor: its workspace gets focus, no window does.
+        assert_eq!(tree.focus_in_direction(Direction::Right), None);
+        assert_eq!(tree.focused_workspace(), Some(ws2));
+        assert_eq!(tree.focused_window(), None);
+
+        // And back out, landing on the window nearest the edge.
+        assert_eq!(tree.focus_in_direction(Direction::Left), Some(w(2)));
+        assert_eq!(tree.focused_workspace(), Some(ws1));
+    }
+
+    #[test]
+    fn focus_stops_at_outer_edge() {
+        let (mut tree, ws1, _) = setup_dual();
+        open(&mut tree, ws1, &[1]);
+        assert_eq!(tree.focus_in_direction(Direction::Left), None);
+        assert_eq!(tree.focused_workspace(), Some(ws1));
+        assert_eq!(tree.focused_window(), Some(w(1)));
     }
 
     #[test]
