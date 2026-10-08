@@ -311,6 +311,16 @@ impl Tree {
     /// moves focus to its nearest sibling. Returns its workspace.
     pub fn remove_window(&mut self, window: WindowId) -> Option<NodeId> {
         let node = self.windows.remove(&window)?;
+        let ws = self.unlink_window(node);
+        self.release(node);
+        self.layout_after_remove(ws);
+        Some(ws)
+    }
+
+    /// Takes a window node out of the tree without freeing it: detaches it,
+    /// tidies its old container and, if it was its workspace's focus, hands
+    /// focus to its nearest sibling. Returns the workspace it left.
+    fn unlink_window(&mut self, node: NodeId) -> NodeId {
         let ws = self.workspace_of(node).expect("window outside a workspace");
         let (parent, idx) = self.index_in_parent(node);
 
@@ -326,7 +336,6 @@ impl Tree {
         });
 
         self.detach(node);
-        self.release(node);
         self.normalize(parent);
 
         if let Some(next) = next_focus {
@@ -335,8 +344,142 @@ impl Tree {
             let next = next.or_else(|| self.first_window(ws));
             self.set_workspace_focus(ws, next);
         }
-        self.layout_after_remove(ws);
-        Some(ws)
+        ws
+    }
+
+    /// Moves `window` one step in `direction`, i3 style:
+    ///
+    /// 1. next to a window in its container along that axis: swap with it;
+    /// 2. next to a split: move into it, at the edge facing the window;
+    /// 3. otherwise: leave the container and land beside the nearest ancestor
+    ///    laid out along that axis;
+    /// 4. at the workspace edge: cross to the next monitor that way, or if
+    ///    there is none, re-orient the workspace so the window can sit
+    ///    beside everything else.
+    ///
+    /// The window keeps focus. Returns `false` if nothing moved.
+    pub fn move_in_direction(&mut self, window: WindowId, direction: Direction) -> bool {
+        let Some(node) = self.window_node(window) else {
+            return false;
+        };
+        let axis = direction.axis();
+        let forward = matches!(direction, Direction::Right | Direction::Down);
+
+        let (parent, idx) = self.index_in_parent(node);
+        if self.container_axis(parent) == Some(axis) {
+            let target = if forward {
+                Some(idx + 1)
+            } else {
+                idx.checked_sub(1)
+            };
+            if let Some(t) = target
+                && let Some(&sibling) = self.node(parent).children.get(t)
+            {
+                if matches!(self.node(sibling).kind, NodeKind::Window { .. }) {
+                    self.swap_siblings(parent, idx, t);
+                } else {
+                    let at = self.facing_edge(sibling, axis, forward);
+                    self.relocate(node, sibling, at);
+                }
+                self.focus_window(window);
+                return true;
+            }
+        }
+
+        let mut child = parent;
+        while !matches!(self.node(child).kind, NodeKind::Workspace { .. }) {
+            let (ancestor, idx) = self.index_in_parent(child);
+            if self.container_axis(ancestor) == Some(axis) {
+                self.relocate(node, ancestor, if forward { idx + 1 } else { idx });
+                self.focus_window(window);
+                return true;
+            }
+            child = ancestor;
+        }
+
+        let ws = child;
+        if self.move_to_adjacent_monitor(node, direction) {
+            self.focus_window(window);
+            return true;
+        }
+        if self.container_axis(ws) != Some(axis) && self.node(ws).children.len() > 1 {
+            self.reorient_workspace(ws, axis);
+            let at = if forward {
+                self.node(ws).children.len()
+            } else {
+                0
+            };
+            self.relocate(node, ws, at);
+            self.focus_window(window);
+            return true;
+        }
+        false
+    }
+
+    /// Moves a window node into the active workspace of the next monitor in
+    /// `direction`, at the edge facing where it came from.
+    fn move_to_adjacent_monitor(&mut self, node: NodeId, direction: Direction) -> bool {
+        let ws = self.workspace_of(node).expect("window outside a workspace");
+        let monitor = self.monitor_of(ws);
+        let Some(target) = self
+            .adjacent_monitor(monitor, direction)
+            .and_then(|m| self.active_workspace(m))
+        else {
+            return false;
+        };
+        let forward = matches!(direction, Direction::Right | Direction::Down);
+        self.unlink_window(node);
+        let at = self.facing_edge(target, direction.axis(), forward);
+        self.insert_child(target, at, node);
+        true
+    }
+
+    /// Where to insert into `container` so a window arriving along `axis`
+    /// lands on the side it came from. Containers on the other axis get it
+    /// appended.
+    fn facing_edge(&self, container: NodeId, axis: Axis, forward: bool) -> usize {
+        let len = self.node(container).children.len();
+        if self.container_axis(container) == Some(axis) && forward {
+            0
+        } else {
+            len
+        }
+    }
+
+    /// Moves a window node to `index` in `new_parent`, then tidies the
+    /// container it left. `new_parent` must not be its current parent.
+    fn relocate(&mut self, node: NodeId, new_parent: NodeId, index: usize) {
+        let (old_parent, _) = self.index_in_parent(node);
+        debug_assert_ne!(old_parent, new_parent);
+        self.detach(node);
+        self.insert_child(new_parent, index, node);
+        self.normalize(old_parent);
+    }
+
+    /// Swaps two children's positions; each slot keeps its size.
+    fn swap_siblings(&mut self, parent: NodeId, a: usize, b: usize) {
+        let children = &mut self.node_mut(parent).children;
+        children.swap(a, b);
+        let (na, nb) = (children[a], children[b]);
+        let wa = self.node(na).weight;
+        self.node_mut(na).weight = self.node(nb).weight;
+        self.node_mut(nb).weight = wa;
+    }
+
+    /// Wraps everything in a workspace into one split keeping the current
+    /// orientation, and lays the workspace out along `axis` instead.
+    fn reorient_workspace(&mut self, ws: NodeId, axis: Axis) {
+        let old_axis = self.container_axis(ws).expect("workspace has an axis");
+        let children = std::mem::take(&mut self.node_mut(ws).children);
+        let split = self.alloc(NodeKind::Split { axis: old_axis });
+        for &c in &children {
+            self.node_mut(c).parent = Some(split);
+        }
+        let s = self.node_mut(split);
+        s.parent = Some(ws);
+        s.children = children;
+        self.node_mut(ws).children = vec![split];
+        self.set_container_axis(ws, axis);
     }
 
     /// Records that `window` has focus, e.g. because the OS reported it.
@@ -515,18 +658,9 @@ impl Tree {
             }
         }
 
-        let monitors = self.node(self.root).children.iter().copied();
-        let monitors = monitors
-            .filter(|&m| m != monitor)
-            .map(|m| (m, self.monitor_work_area(m)));
-        let next_monitor = neighbour(self.monitor_work_area(monitor), monitors, direction)?;
-        let NodeKind::Monitor {
-            active_workspace, ..
-        } = self.node(next_monitor).kind
-        else {
-            unreachable!("root child is not a monitor");
-        };
-        let next_ws = active_workspace?;
+        let next_ws = self
+            .adjacent_monitor(monitor, direction)
+            .and_then(|m| self.active_workspace(m))?;
         self.focus_workspace(next_ws);
 
         // Odd monitor offsets can leave no window strictly in `direction`;
@@ -536,6 +670,24 @@ impl Tree {
             .or_else(|| self.workspace_windows(next_ws).first().copied())?;
         self.focus_window(target);
         Some(target)
+    }
+
+    /// The nearest other monitor in `direction`.
+    fn adjacent_monitor(&self, monitor: NodeId, direction: Direction) -> Option<NodeId> {
+        let others = self.node(self.root).children.iter().copied();
+        let others = others
+            .filter(|&m| m != monitor)
+            .map(|m| (m, self.monitor_work_area(m)));
+        neighbour(self.monitor_work_area(monitor), others, direction)
+    }
+
+    fn active_workspace(&self, monitor: NodeId) -> Option<NodeId> {
+        match self.node(monitor).kind {
+            NodeKind::Monitor {
+                active_workspace, ..
+            } => active_workspace,
+            _ => panic!("{monitor:?} is not a monitor"),
+        }
     }
 
     fn monitor_work_area(&self, monitor: NodeId) -> Rect {
@@ -1012,6 +1164,131 @@ mod tests {
         assert_eq!(tree.focus_in_direction(Direction::Left), None);
         assert_eq!(tree.focused_workspace(), Some(ws1));
         assert_eq!(tree.focused_window(), Some(w(1)));
+    }
+
+    #[test]
+    fn move_swaps_with_neighbouring_window() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2, 3]);
+        tree.resize(w(1), Axis::Horizontal, 0.2);
+        let first_slot = tree.arrange(ws, Gaps::default())[0].1;
+
+        assert!(tree.move_in_direction(w(1), Direction::Right));
+        assert_eq!(tree.debug_layout(ws), "H[2 1 3]");
+        // Slots keep their size; the windows trade places.
+        assert_eq!(tree.arrange(ws, Gaps::default())[0].1, first_slot);
+        assert_eq!(tree.focused_window(), Some(w(1)));
+    }
+
+    #[test]
+    fn move_enters_neighbouring_split() {
+        // H[1 V[2 3]]: 1 moves into the V split, which is then the only
+        // thing in the workspace, so the workspace adopts it.
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        tree.split(w(2), Axis::Vertical);
+        open(&mut tree, ws, &[3]);
+        assert!(tree.move_in_direction(w(1), Direction::Right));
+        assert_eq!(tree.debug_layout(ws), "V[2 3 1]");
+        weights_sum_to_one(&tree, ws);
+    }
+
+    #[test]
+    fn move_swaps_then_leaves_nested_split() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        tree.split(w(2), Axis::Vertical);
+        open(&mut tree, ws, &[3]);
+        tree.split(w(3), Axis::Horizontal);
+        open(&mut tree, ws, &[4]);
+        assert_eq!(tree.debug_layout(ws), "H[1 V[2 H[3 4]]]");
+        // From 4, moving left swaps with 3; moving left again leaves H[..]
+        // for the nearest horizontal ancestor (the workspace).
+        assert!(tree.move_in_direction(w(4), Direction::Left));
+        assert_eq!(tree.debug_layout(ws), "H[1 V[2 H[4 3]]]");
+        assert!(tree.move_in_direction(w(4), Direction::Left));
+        assert_eq!(tree.debug_layout(ws), "H[1 4 V[2 3]]");
+        weights_sum_to_one(&tree, ws);
+    }
+
+    #[test]
+    fn move_leaves_split_beside_ancestor() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        tree.split(w(2), Axis::Vertical);
+        open(&mut tree, ws, &[3]);
+        assert!(tree.move_in_direction(w(3), Direction::Left));
+        assert_eq!(tree.debug_layout(ws), "H[1 3 2]");
+        weights_sum_to_one(&tree, ws);
+    }
+
+    #[test]
+    fn move_at_edge_reorients_workspace() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2, 3]);
+        assert!(tree.move_in_direction(w(3), Direction::Down));
+        assert_eq!(tree.debug_layout(ws), "V[H[1 2] 3]");
+        // Moving back up enters the neighbouring split: a clean round trip.
+        assert!(tree.move_in_direction(w(3), Direction::Up));
+        assert_eq!(tree.debug_layout(ws), "H[1 2 3]");
+        weights_sum_to_one(&tree, ws);
+    }
+
+    #[test]
+    fn move_from_split_at_edge_reorients_workspace() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        tree.split(w(2), Axis::Vertical);
+        open(&mut tree, ws, &[3]);
+        assert!(tree.move_in_direction(w(3), Direction::Down));
+        assert_eq!(tree.debug_layout(ws), "V[H[1 2] 3]");
+    }
+
+    #[test]
+    fn move_at_outer_edge_does_nothing() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        assert!(!tree.move_in_direction(w(1), Direction::Left));
+        assert!(!tree.move_in_direction(w(2), Direction::Right));
+        assert_eq!(tree.debug_layout(ws), "H[1 2]");
+        // A lone window has nowhere to go either.
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1]);
+        assert!(!tree.move_in_direction(w(1), Direction::Down));
+        assert_eq!(tree.debug_layout(ws), "H[1]");
+    }
+
+    #[test]
+    fn move_crosses_to_next_monitor() {
+        let (mut tree, ws1, ws2) = setup_dual();
+        open(&mut tree, ws1, &[1, 2]);
+        tree.focus_workspace(ws2);
+        open(&mut tree, ws2, &[3]);
+
+        assert!(tree.move_in_direction(w(2), Direction::Right));
+        assert_eq!(tree.debug_layout(ws1), "H[1]");
+        assert_eq!(tree.debug_layout(ws2), "H[2 3]");
+        assert_eq!(tree.focused_workspace(), Some(ws2));
+        assert_eq!(tree.focused_window(), Some(w(2)));
+        // The workspace it left still remembers a focused window.
+        tree.focus_in_direction(Direction::Left);
+        assert_eq!(tree.focused_window(), Some(w(1)));
+
+        assert!(tree.move_in_direction(w(1), Direction::Right));
+        assert_eq!(tree.debug_layout(ws1), "H[]");
+        assert_eq!(tree.debug_layout(ws2), "H[1 2 3]");
+        weights_sum_to_one(&tree, ws2);
+    }
+
+    #[test]
+    fn move_into_empty_monitor_and_back() {
+        let (mut tree, ws1, ws2) = setup_dual();
+        open(&mut tree, ws1, &[1]);
+        assert!(tree.move_in_direction(w(1), Direction::Right));
+        assert_eq!(tree.debug_layout(ws2), "H[1]");
+        assert!(tree.move_in_direction(w(1), Direction::Left));
+        assert_eq!(tree.debug_layout(ws1), "H[1]");
+        assert_eq!(tree.focused_workspace(), Some(ws1));
     }
 
     #[test]

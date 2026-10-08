@@ -5,6 +5,9 @@ use crate::{Axis, Direction};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Command {
     Focus(Direction),
+    /// Move the focused window one step in a direction (swap, enter or
+    /// leave splits, or cross monitors).
+    Move(Direction),
     /// The next window opens beside the focused one along this axis.
     Split(Axis),
     /// Like `Split`, using the opposite axis of the focused window's container.

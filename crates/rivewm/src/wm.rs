@@ -77,6 +77,14 @@ impl Wm {
                     );
                 }
             }
+            Command::Move(direction) => {
+                // May span two monitors, so re-tile everything.
+                if let Some(id) = focused
+                    && self.tree.move_in_direction(id, direction)
+                {
+                    self.apply_all();
+                }
+            }
             Command::Split(axis) => {
                 if let Some(id) = focused {
                     self.tree.split(id, axis);
