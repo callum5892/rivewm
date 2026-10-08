@@ -3,6 +3,7 @@ name = "rivewm"
 description = "A tiling window manager for Windows"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"

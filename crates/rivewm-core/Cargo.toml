@@ -3,6 +3,7 @@ name = "rivewm-core"
 description = "Platform-independent window tree and layout logic for rivewm"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 
