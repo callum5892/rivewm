@@ -1,9 +1,11 @@
+mod bindings;
 mod wm;
 
 use std::collections::HashSet;
 
 use anyhow::{Context, Result, bail};
 use rivewm_core::{Gaps, WindowEvent, WindowId};
+use rivewm_platform::{Event, Hotkey};
 use tracing_subscriber::EnvFilter;
 use wm::Wm;
 
@@ -40,8 +42,19 @@ fn main() -> Result<()> {
 }
 
 fn run() -> Result<()> {
+    let mut hotkeys = Vec::new();
+    let mut commands = Vec::new();
+    for (key, command) in bindings::defaults() {
+        hotkeys.push(key.parse::<Hotkey>()?);
+        commands.push(command);
+    }
+
     // Hooks first, so no window that opens during startup is missed.
-    let (_events, rx) = rivewm_platform::EventThread::spawn().context("failed to install hooks")?;
+    let (events, rx) =
+        rivewm_platform::EventThread::spawn(hotkeys).context("failed to install hooks")?;
+    for (hotkey, err) in events.failed_hotkeys() {
+        tracing::warn!(%hotkey, %err, "couldn't register hotkey; is another app using it?");
+    }
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -57,11 +70,19 @@ fn run() -> Result<()> {
 
     let mut wm = Wm::new(Gaps { inner: 8, outer: 8 });
     wm.manage_existing();
-    tracing::info!("rivewm running. Ctrl+C to quit.");
+    tracing::info!("rivewm running. Alt+Shift+E or Ctrl+C to quit.");
 
     for event in rx {
-        wm.handle(event);
+        match event {
+            Event::Window(event) => wm.handle(event),
+            Event::Hotkey(i) => {
+                if wm.execute(commands[i]).is_break() {
+                    break;
+                }
+            }
+        }
     }
+    tracing::info!("shutting down");
     wm::restore_all();
     Ok(())
 }
@@ -115,7 +136,8 @@ fn list(all: bool) -> Result<()> {
 }
 
 fn events(all: bool) -> Result<()> {
-    let (_thread, rx) = rivewm_platform::EventThread::spawn().context("failed to install hooks")?;
+    let (_thread, rx) =
+        rivewm_platform::EventThread::spawn(Vec::new()).context("failed to install hooks")?;
     let start = std::time::Instant::now();
 
     // Windows we've seen as tileable. Hidden/destroyed windows can no longer
@@ -130,7 +152,10 @@ fn events(all: bool) -> Result<()> {
         "Listening for window events ({} tileable windows). Ctrl+C to stop.",
         known.len()
     );
-    for event in rx {
+    for event in rx.into_iter().filter_map(|e| match e {
+        Event::Window(event) => Some(event),
+        Event::Hotkey(_) => None,
+    }) {
         let id = event.window();
         let info = rivewm_platform::query_window(id);
         let tileable = info.as_ref().is_some_and(|w| w.is_manageable());

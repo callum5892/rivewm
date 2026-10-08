@@ -2,9 +2,10 @@
 //! the resulting layout to real windows.
 
 use std::collections::{BTreeSet, HashMap};
+use std::ops::ControlFlow;
 use std::sync::Mutex;
 
-use rivewm_core::{Gaps, Layout, MonitorId, NodeId, Tree, WindowEvent, WindowId};
+use rivewm_core::{Command, Gaps, Layout, MonitorId, NodeId, Tree, WindowEvent, WindowId};
 use tracing::{debug, info, warn};
 
 /// Every window we currently manage, kept outside `Wm` so the Ctrl+C handler
@@ -58,10 +59,46 @@ impl Wm {
         if let Some(fg) = rivewm_platform::foreground_window() {
             self.tree.focus_window(fg);
         }
-        let workspaces: Vec<_> = self.workspace_for_monitor.values().copied().collect();
-        for ws in workspaces {
-            self.apply(ws);
+        self.apply_all();
+    }
+
+    /// Runs a user command. Returns `Break` when the WM should exit.
+    pub fn execute(&mut self, command: Command) -> ControlFlow<()> {
+        debug!(?command);
+        let focused = self.tree.focused_window();
+        match command {
+            Command::Focus(direction) => {
+                if let Some(target) = self.tree.focus_in_direction(direction)
+                    && !rivewm_platform::focus_window(target)
+                {
+                    warn!(
+                        window = format_args!("{:#x}", target.0),
+                        "Windows refused focus change"
+                    );
+                }
+            }
+            Command::Split(axis) => {
+                if let Some(id) = focused {
+                    self.tree.split(id, axis);
+                }
+            }
+            Command::ToggleSplit => {
+                if let Some(id) = focused {
+                    self.tree.toggle_split(id);
+                }
+            }
+            Command::Resize { axis, delta } => {
+                if let Some(id) = focused
+                    && self.tree.resize(id, axis, delta)
+                    && let Some(ws) = self.tree.focused_workspace()
+                {
+                    self.apply(ws);
+                }
+            }
+            Command::Retile => self.apply_all(),
+            Command::Quit => return ControlFlow::Break(()),
         }
+        ControlFlow::Continue(())
     }
 
     pub fn handle(&mut self, event: WindowEvent) {
@@ -118,6 +155,12 @@ impl Wm {
         if let Some(ws) = self.tree.remove_window(id) {
             lock_managed().remove(&id);
             info!(window = format_args!("{:#x}", id.0), "unmanaged");
+            self.apply(ws);
+        }
+    }
+
+    fn apply_all(&self) {
+        for &ws in self.workspace_for_monitor.values() {
             self.apply(ws);
         }
     }

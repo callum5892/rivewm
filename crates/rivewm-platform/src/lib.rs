@@ -7,14 +7,17 @@
 #![cfg(windows)]
 
 mod events;
+mod hotkey;
 mod monitor;
 mod process;
 mod window;
 
-pub use events::EventThread;
+pub use events::{Event, EventThread};
+pub use hotkey::{Hotkey, ParseHotkeyError};
 pub use monitor::{MonitorInfo, monitors};
 pub use window::{
-    Skip, WindowInfo, enumerate_windows, foreground_window, query_window, set_frame, show_window,
+    Skip, WindowInfo, enumerate_windows, focus_window, foreground_window, query_window, set_frame,
+    show_window,
 };
 
 use windows::Win32::UI::HiDpi::{

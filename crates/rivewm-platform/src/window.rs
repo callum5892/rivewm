@@ -10,8 +10,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetForegroundWindow, GetWindow,
     GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
     IsWindowVisible, IsZoomed, SW_RESTORE, SW_SHOWNA, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
-    SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
+    SWP_NOOWNERZORDER, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
 use windows::core::BOOL;
 
@@ -103,6 +104,12 @@ fn hwnd(id: WindowId) -> HWND {
 pub fn foreground_window() -> Option<WindowId> {
     let hwnd = unsafe { GetForegroundWindow() };
     (!hwnd.is_invalid()).then_some(WindowId(hwnd.0 as isize))
+}
+
+/// Gives a window keyboard focus. Returns `false` if Windows refused, which
+/// its foreground-lock rules allow it to do.
+pub fn focus_window(id: WindowId) -> bool {
+    unsafe { SetForegroundWindow(hwnd(id)) }.as_bool()
 }
 
 /// Positions a window so its *visible* frame lands exactly on `frame`.

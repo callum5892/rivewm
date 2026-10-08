@@ -383,6 +383,19 @@ impl Tree {
         true
     }
 
+    /// Splits `window` along the opposite axis to its current container, so
+    /// one key alternates between side-by-side and stacked.
+    pub fn toggle_split(&mut self, window: WindowId) -> bool {
+        let Some(node) = self.window_node(window) else {
+            return false;
+        };
+        let parent = self.node(node).parent.expect("window has no parent");
+        let axis = self
+            .container_axis(parent)
+            .expect("window parent is not a container");
+        self.split(window, axis.flip())
+    }
+
     /// Grows (positive `delta`) or shrinks the window along `axis`, by taking
     /// share from its siblings in the nearest container laid out on that axis.
     /// `delta` is a fraction of that container, e.g. `0.05` for 5%.
@@ -758,6 +771,17 @@ mod tests {
                 (w(3), Rect::new(500, 250, 500, 250)),
             ]
         );
+    }
+
+    #[test]
+    fn toggle_split_alternates_axis() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        tree.toggle_split(w(2));
+        open(&mut tree, ws, &[3]);
+        tree.toggle_split(w(3));
+        open(&mut tree, ws, &[4]);
+        assert_eq!(tree.debug_layout(ws), "H[1 V[2 H[3 4]]]");
     }
 
     #[test]

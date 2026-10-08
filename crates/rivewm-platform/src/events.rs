@@ -6,20 +6,32 @@ use rivewm_core::{WindowEvent, WindowId};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey};
 use windows::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, DispatchMessageW, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
     EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW,
     EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
     EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GetMessageW,
     MSG, OBJID_WINDOW, PostThreadMessageW, TranslateMessage, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_QUIT,
+    WINEVENT_SKIPOWNPROCESS, WM_HOTKEY, WM_QUIT,
 };
+
+use crate::Hotkey;
+
+/// Everything the event thread reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    Window(WindowEvent),
+    /// A registered hotkey was pressed; the value is its index in the list
+    /// passed to [`EventThread::spawn`].
+    Hotkey(usize),
+}
 
 thread_local! {
     /// Where the hook callback sends events. Out-of-context WinEvent hooks
     /// are delivered on the thread that installed them, so a thread-local is
     /// enough and avoids any global state.
-    static SENDER: RefCell<Option<Sender<WindowEvent>>> = const { RefCell::new(None) };
+    static SENDER: RefCell<Option<Sender<Event>>> = const { RefCell::new(None) };
 }
 
 /// Hook ranges we listen to. Two narrow ranges instead of `EVENT_MIN..MAX`
@@ -29,32 +41,44 @@ const HOOK_RANGES: [(u32, u32); 2] = [
     (EVENT_OBJECT_DESTROY, EVENT_OBJECT_UNCLOAKED),
 ];
 
-/// A background thread that pumps Win32 messages and forwards window events.
+/// Startup result sent from the event thread: its id, plus each hotkey that
+/// couldn't be registered (usually because another app owns it).
+type Ready = windows::core::Result<(u32, Vec<(Hotkey, windows::core::Error)>)>;
+
+/// A background thread that pumps Win32 messages, forwarding window events
+/// and global hotkey presses.
 pub struct EventThread {
     thread_id: u32,
     join: Option<JoinHandle<()>>,
+    failed_hotkeys: Vec<(Hotkey, windows::core::Error)>,
 }
 
 impl EventThread {
-    /// Installs the WinEvent hooks on a new thread and returns a receiver for
-    /// the events they produce.
-    pub fn spawn() -> windows::core::Result<(Self, Receiver<WindowEvent>)> {
+    /// Installs the WinEvent hooks and registers `hotkeys` on a new thread,
+    /// and returns a receiver for the events they produce.
+    pub fn spawn(hotkeys: Vec<Hotkey>) -> windows::core::Result<(Self, Receiver<Event>)> {
         let (event_tx, event_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
 
         let join = std::thread::Builder::new()
             .name("rivewm-events".into())
-            .spawn(move || run(event_tx, ready_tx))
+            .spawn(move || run(event_tx, ready_tx, hotkeys))
             .expect("failed to spawn event thread");
 
-        let thread_id = ready_rx
+        let (thread_id, failed_hotkeys) = ready_rx
             .recv()
             .expect("event thread exited before reporting")?;
         let thread = Self {
             thread_id,
             join: Some(join),
+            failed_hotkeys,
         };
         Ok((thread, event_rx))
+    }
+
+    /// Hotkeys that couldn't be registered, with the reason.
+    pub fn failed_hotkeys(&self) -> &[(Hotkey, windows::core::Error)] {
+        &self.failed_hotkeys
     }
 
     /// Stops the message loop, removes the hooks and joins the thread.
@@ -78,8 +102,8 @@ impl Drop for EventThread {
     }
 }
 
-fn run(event_tx: Sender<WindowEvent>, ready_tx: mpsc::SyncSender<windows::core::Result<u32>>) {
-    SENDER.with(|s| *s.borrow_mut() = Some(event_tx));
+fn run(event_tx: Sender<Event>, ready_tx: mpsc::SyncSender<Ready>, hotkeys: Vec<Hotkey>) {
+    SENDER.with(|s| *s.borrow_mut() = Some(event_tx.clone()));
 
     let mut hooks = Vec::new();
     for (min, max) in HOOK_RANGES {
@@ -102,17 +126,37 @@ fn run(event_tx: Sender<WindowEvent>, ready_tx: mpsc::SyncSender<windows::core::
         hooks.push(hook);
     }
 
-    let _ = ready_tx.send(Ok(unsafe { GetCurrentThreadId() }));
+    // With no window, WM_HOTKEY is posted to this thread's message queue.
+    let mut registered = Vec::new();
+    let mut failed = Vec::new();
+    for (i, hotkey) in hotkeys.iter().enumerate() {
+        let id = i as i32;
+        match unsafe { RegisterHotKey(None, id, hotkey.modifiers | MOD_NOREPEAT, hotkey.vk) } {
+            Ok(()) => registered.push(id),
+            Err(err) => failed.push((*hotkey, err)),
+        }
+    }
+
+    let _ = ready_tx.send(Ok((unsafe { GetCurrentThreadId() }, failed)));
 
     let mut msg = MSG::default();
     // GetMessageW returns 0 on WM_QUIT and -1 on error; stop on both.
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
+        if msg.message == WM_HOTKEY && msg.hwnd.is_invalid() {
+            let _ = event_tx.send(Event::Hotkey(msg.wParam.0));
+            continue;
+        }
         unsafe {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
 
+    for id in registered {
+        unsafe {
+            let _ = UnregisterHotKey(None, id);
+        }
+    }
     unhook_all(&hooks);
 }
 
@@ -142,7 +186,7 @@ unsafe extern "system" fn win_event_proc(
     };
     SENDER.with(|s| {
         if let Some(tx) = s.borrow().as_ref() {
-            let _ = tx.send(event);
+            let _ = tx.send(Event::Window(event));
         }
     });
 }
