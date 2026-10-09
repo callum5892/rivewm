@@ -26,6 +26,8 @@ pub struct Config {
     pub border: Border,
     /// Resize neighbours while an edge is being dragged, not just on release.
     pub live_resize: bool,
+    /// Focus the window under the mouse as it moves.
+    pub focus_follows_mouse: bool,
     pub bindings: Vec<(Hotkey, Command)>,
     pub rules: Vec<Rule>,
 }
@@ -126,6 +128,7 @@ struct RawConfig {
     gaps: Option<RawGaps>,
     border: Option<RawBorder>,
     resize: Option<RawResize>,
+    focus: Option<RawFocus>,
     floating: Option<RawFloating>,
     layout: Option<RawLayout>,
     keybindings: Option<BTreeMap<String, String>>,
@@ -137,6 +140,12 @@ struct RawConfig {
 struct RawGaps {
     inner: Option<i32>,
     outer: Option<i32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFocus {
+    follows_mouse: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -217,6 +226,12 @@ pub fn parse(text: &str) -> Result<Config> {
         unfocused: color(user_border.unfocused, default_border.unfocused, "unfocused")?,
     };
 
+    let focus_follows_mouse = user
+        .focus
+        .and_then(|f| f.follows_mouse)
+        .or(defaults.focus.and_then(|f| f.follows_mouse))
+        .unwrap_or(false);
+
     let live_resize = user
         .resize
         .and_then(|r| r.live)
@@ -257,6 +272,7 @@ pub fn parse(text: &str) -> Result<Config> {
         default_layout,
         border,
         live_resize,
+        focus_follows_mouse,
         bindings,
         rules,
     })
@@ -353,6 +369,13 @@ mod tests {
             let err = format!("{:#}", parse(&text).unwrap_err());
             assert!(err.contains("focused") && err.contains(bad), "{err}");
         }
+    }
+
+    #[test]
+    fn focus_follows_mouse_option() {
+        assert!(!parse(DEFAULT_CONFIG).unwrap().focus_follows_mouse);
+        let on = parse("[focus]\nfollows_mouse = true").unwrap();
+        assert!(on.focus_follows_mouse);
     }
 
     #[test]

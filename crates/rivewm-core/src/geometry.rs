@@ -1,5 +1,7 @@
 /// An axis-aligned rectangle in physical screen pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,

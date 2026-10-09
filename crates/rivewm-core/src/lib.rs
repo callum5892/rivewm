@@ -13,7 +13,10 @@ pub use command::{Command, ParseCommandError};
 pub use event::WindowEvent;
 pub use geometry::Rect;
 pub use layout::Layout;
-pub use tree::{Axis, Direction, Gaps, MonitorSpec, NodeId, SavedWeights, Tree};
+pub use tree::{
+    Axis, Direction, Gaps, MonitorSpec, NodeId, SavedFloat, SavedNode, SavedWeights,
+    SavedWorkspace, Tree,
+};
 
 /// Opaque identifier for a native window.
 ///

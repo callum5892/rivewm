@@ -1,5 +1,6 @@
 mod background;
 mod config;
+mod persist;
 mod subscribe;
 mod wm;
 
@@ -109,6 +110,8 @@ enum Msg {
     Request(String, SyncSender<String>),
     /// An IPC client subscribed; send it event lines here.
     Subscribe(SyncSender<String>),
+    /// Ctrl+C: quit cleanly, saving the layout first.
+    Quit,
 }
 
 /// How long display changes must stop before monitors are re-read.
@@ -125,6 +128,7 @@ fn run(config_path: &Path) -> Result<()> {
 
     // The IPC pipe goes first: it doubles as the check that no other rivewm
     // is running, before we touch any windows.
+    let quit_tx = tx.clone();
     let ipc_tx = tx.clone();
     rivewm_platform::ipc::serve(move |line, conn| {
         if line.trim() == "subscribe" {
@@ -174,10 +178,16 @@ fn run(config_path: &Path) -> Result<()> {
         tracing::error!("{info}");
         default_hook(info);
     }));
-    ctrlc::set_handler(|| {
-        tracing::info!("shutting down");
-        wm::restore_all();
-        std::process::exit(0);
+    let pressed_once = std::sync::atomic::AtomicBool::new(false);
+    ctrlc::set_handler(move || {
+        // First press: let the main loop shut down cleanly. A second press
+        // (or a main loop that has gone away) exits on the spot.
+        let again = pressed_once.swap(true, std::sync::atomic::Ordering::SeqCst);
+        if again || quit_tx.send(Msg::Quit).is_err() {
+            tracing::info!("shutting down");
+            wm::restore_all();
+            std::process::exit(0);
+        }
     })
     .context("failed to install Ctrl+C handler")?;
 
@@ -244,6 +254,7 @@ fn run(config_path: &Path) -> Result<()> {
                 let _ = reply.send(response.to_string());
                 flow
             }
+            Msg::Quit => ControlFlow::Break(()),
             Msg::Subscribe(subscriber) => {
                 app.subscribe(subscriber);
                 ControlFlow::Continue(())
@@ -255,6 +266,7 @@ fn run(config_path: &Path) -> Result<()> {
         }
     }
     tracing::info!("shutting down");
+    app.wm.save();
     wm::restore_all();
     Ok(())
 }

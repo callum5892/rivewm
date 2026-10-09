@@ -25,6 +25,12 @@ Alt+Tab.
 - **Floating windows**: dialogs and fixed-size windows float automatically;
   any window can be toggled. Optionally kept always on top.
 - **Fullscreen** toggle that covers the whole monitor.
+- **Minimize keeps your layout**: a minimized window's neighbours close up
+  over it, and restoring it puts it back exactly where it was.
+- **Layout survives restarts**: workspaces, splits, sizes and floating
+  positions are saved, and restarting rivewm puts every window back (not
+  across reboots).
+- **Focus follows mouse** (optional): hovering a window focuses it.
 - **Focus border**: the focused window's border is coloured (Hyprland's cyan
   by default), using Windows 11's own window border.
 - **Multi-monitor**, including monitors being connected or disconnected:
@@ -109,6 +115,9 @@ default = "dwindle"          # or "manual"
 enabled = true
 focused = "#33ccff"          # "#rrggbb", "default" or "none"
 unfocused = "#595959"
+
+[focus]
+follows_mouse = false        # focus the window under the mouse
 
 [resize]
 live = true                  # neighbours follow a dragged edge

@@ -9,6 +9,9 @@
 
 use std::collections::HashMap;
 
+mod saved;
+pub use saved::{SavedFloat, SavedNode, SavedWorkspace};
+
 use crate::layout::Layout;
 use crate::{MonitorId, Rect, WindowId};
 
@@ -19,7 +22,8 @@ const MIN_WEIGHT: f64 = 0.05;
 pub struct NodeId(u32);
 
 /// The direction a container lays out its children.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Axis {
     /// Children side by side, left to right.
     Horizontal,
@@ -123,6 +127,9 @@ pub enum NodeKind {
         /// Where the window sits while floating. Remembered while it's tiled
         /// so toggling back restores it.
         float_rect: Option<Rect>,
+        /// Minimized windows keep their place in the tree but take no space,
+        /// so they come back exactly where they were.
+        minimized: bool,
     },
 }
 
@@ -213,6 +220,7 @@ impl Tree {
         let fullscreen = self.fullscreen_node(ws);
         self.floating_nodes(ws)
             .iter()
+            .filter(|&&n| self.is_shown(n))
             .filter_map(|&n| match self.node(n).kind {
                 _ if fullscreen == Some(n) => {
                     Some((self.window_id(n), self.monitor_bounds(self.monitor_of(ws))))
@@ -284,6 +292,55 @@ impl Tree {
             self.node(node).kind,
             NodeKind::Window { floating: true, .. }
         )
+    }
+
+    pub fn is_minimized(&self, window: WindowId) -> bool {
+        self.window_node(window).is_some_and(|n| {
+            matches!(
+                self.node(n).kind,
+                NodeKind::Window {
+                    minimized: true,
+                    ..
+                }
+            )
+        })
+    }
+
+    /// Whether a node takes up space: a window that isn't minimized, or a
+    /// container with at least one such window inside.
+    pub(crate) fn is_shown(&self, node: NodeId) -> bool {
+        match self.node(node).kind {
+            NodeKind::Window { minimized, .. } => !minimized,
+            _ => self.node(node).children.iter().any(|&c| self.is_shown(c)),
+        }
+    }
+
+    /// Minimizes or restores a window. A minimized window keeps its place in
+    /// the tree (tiled) or its position (floating) but takes no space, so
+    /// restoring it puts it back exactly where it was. Minimizing hands
+    /// focus to another window in the workspace and ends fullscreen.
+    pub fn set_minimized(&mut self, window: WindowId, value: bool) -> bool {
+        let Some(node) = self.window_node(window) else {
+            return false;
+        };
+        let NodeKind::Window { minimized, .. } = &mut self.node_mut(node).kind else {
+            return false;
+        };
+        if *minimized == value {
+            return false;
+        }
+        *minimized = value;
+        if value {
+            let ws = self.workspace_of(node).expect("window outside a workspace");
+            if self.fullscreen_node(ws) == Some(node) {
+                self.set_fullscreen_node(ws, None);
+            }
+            if self.workspace_focus(ws) == Some(node) {
+                let next = self.fallback_focus(ws);
+                self.set_workspace_focus(ws, next);
+            }
+        }
+        true
     }
 
     fn floating_nodes(&self, ws: NodeId) -> &[NodeId] {
@@ -380,27 +437,34 @@ impl Tree {
         (parent, idx)
     }
 
-    fn first_window(&self, mut id: NodeId) -> Option<NodeId> {
-        loop {
-            match self.node(id).kind {
-                NodeKind::Window { .. } => return Some(id),
-                _ => id = *self.node(id).children.first()?,
-            }
+    /// The first window under `id` in tree order that isn't minimized.
+    fn first_window(&self, id: NodeId) -> Option<NodeId> {
+        match self.node(id).kind {
+            NodeKind::Window { minimized, .. } => (!minimized).then_some(id),
+            _ => self
+                .node(id)
+                .children
+                .iter()
+                .find_map(|&c| self.first_window(c)),
         }
     }
 
-    /// The last tiled window in `ws` in tree order: the innermost of a
-    /// dwindle spiral.
+    /// The last tiled, non-minimized window in `ws` in tree order: the
+    /// innermost of a dwindle spiral.
     pub(crate) fn last_tiled_window(&self, ws: NodeId) -> Option<NodeId> {
         self.last_window(ws)
     }
 
-    fn last_window(&self, mut id: NodeId) -> Option<NodeId> {
-        loop {
-            match self.node(id).kind {
-                NodeKind::Window { .. } => return Some(id),
-                _ => id = *self.node(id).children.last()?,
-            }
+    /// The last window under `id` in tree order that isn't minimized.
+    fn last_window(&self, id: NodeId) -> Option<NodeId> {
+        match self.node(id).kind {
+            NodeKind::Window { minimized, .. } => (!minimized).then_some(id),
+            _ => self
+                .node(id)
+                .children
+                .iter()
+                .rev()
+                .find_map(|&c| self.last_window(c)),
         }
     }
 
@@ -717,6 +781,7 @@ impl Tree {
             id: window,
             floating: false,
             float_rect: None,
+            minimized: false,
         });
         self.windows.insert(window, node);
         self.layout_insert(ws, node);
@@ -734,6 +799,7 @@ impl Tree {
             id: window,
             floating: true,
             float_rect: Some(rect),
+            minimized: false,
         });
         self.windows.insert(window, node);
         self.node_mut(node).parent = Some(ws);
@@ -835,8 +901,13 @@ impl Tree {
     /// Something in `ws` to focus when nothing nearer applies: the first
     /// tiled window, else the newest floating one.
     fn fallback_focus(&self, ws: NodeId) -> Option<NodeId> {
-        self.first_window(ws)
-            .or_else(|| self.floating_nodes(ws).last().copied())
+        self.first_window(ws).or_else(|| {
+            self.floating_nodes(ws)
+                .iter()
+                .rev()
+                .copied()
+                .find(|&n| self.is_shown(n))
+        })
     }
 
     /// Sends a window to another workspace, placed by that workspace's
@@ -926,24 +997,17 @@ impl Tree {
         let forward = matches!(direction, Direction::Right | Direction::Down);
 
         let (parent, idx) = self.index_in_parent(node);
-        if self.container_axis(parent) == Some(axis) {
-            let target = if forward {
-                Some(idx + 1)
+        if self.container_axis(parent) == Some(axis)
+            && let Some((t, sibling)) = self.shown_neighbour(parent, idx, forward)
+        {
+            if matches!(self.node(sibling).kind, NodeKind::Window { .. }) {
+                self.swap_siblings(parent, idx, t);
             } else {
-                idx.checked_sub(1)
-            };
-            if let Some(t) = target
-                && let Some(&sibling) = self.node(parent).children.get(t)
-            {
-                if matches!(self.node(sibling).kind, NodeKind::Window { .. }) {
-                    self.swap_siblings(parent, idx, t);
-                } else {
-                    let at = self.facing_edge(sibling, axis, forward);
-                    self.relocate(node, sibling, at);
-                }
-                self.focus_window(window);
-                return true;
+                let at = self.facing_edge(sibling, axis, forward);
+                self.relocate(node, sibling, at);
             }
+            self.focus_window(window);
+            return true;
         }
 
         let mut child = parent;
@@ -1166,6 +1230,23 @@ impl Tree {
         }
     }
 
+    /// The nearest sibling of the child at `idx` in `parent`, after it
+    /// (`forward`) or before it, that isn't hidden by being minimized.
+    fn shown_neighbour(
+        &self,
+        parent: NodeId,
+        idx: usize,
+        forward: bool,
+    ) -> Option<(usize, NodeId)> {
+        let children = &self.node(parent).children;
+        let mut candidates: Box<dyn Iterator<Item = usize>> = if forward {
+            Box::new(idx + 1..children.len())
+        } else {
+            Box::new((0..idx).rev())
+        };
+        candidates.find_map(|i| self.is_shown(children[i]).then_some((i, children[i])))
+    }
+
     /// Records the size of every split and window in a workspace, so a
     /// series of resizes can each start from the same place (see
     /// [`Self::restore_weights`]).
@@ -1224,34 +1305,36 @@ impl Tree {
         let mut child = node;
         while child != ws {
             let (parent, idx) = self.index_in_parent(child);
-            if self.container_axis(parent) == Some(axis) {
-                let across = if forward {
-                    Some(idx + 1)
-                } else {
-                    idx.checked_sub(1)
+            if self.container_axis(parent) == Some(axis)
+                && let Some((_, neighbour)) = self.shown_neighbour(parent, idx, forward)
+            {
+                // Minimized siblings take no space, so leave them out.
+                let children: Vec<NodeId> = self
+                    .node(parent)
+                    .children
+                    .iter()
+                    .copied()
+                    .filter(|&c| self.is_shown(c))
+                    .collect();
+                let rect = rects[&parent];
+                let along = match axis {
+                    Axis::Horizontal => rect.width,
+                    Axis::Vertical => rect.height,
                 };
-                if let Some(&neighbour) = across.and_then(|i| self.node(parent).children.get(i)) {
-                    let children = &self.node(parent).children;
-                    let rect = rects[&parent];
-                    let along = match axis {
-                        Axis::Horizontal => rect.width,
-                        Axis::Vertical => rect.height,
-                    };
-                    let space = along - gaps.inner * (children.len() as i32 - 1);
-                    if space <= 0 {
-                        return false;
-                    }
-                    let total: f64 = children.iter().map(|&c| self.node(c).weight).sum();
-                    let (mine, theirs) = (self.node(child).weight, self.node(neighbour).weight);
-                    // Neither side may shrink below the minimum. The bounds
-                    // always straddle zero, which `clamp` requires.
-                    let lowest = (MIN_WEIGHT * total - mine).min(0.0);
-                    let highest = (theirs - MIN_WEIGHT * total).max(0.0);
-                    let delta = (grow as f64 / space as f64 * total).clamp(lowest, highest);
-                    self.node_mut(child).weight += delta;
-                    self.node_mut(neighbour).weight -= delta;
-                    return true;
+                let space = along - gaps.inner * (children.len() as i32 - 1);
+                if space <= 0 {
+                    return false;
                 }
+                let total: f64 = children.iter().map(|&c| self.node(c).weight).sum();
+                let (mine, theirs) = (self.node(child).weight, self.node(neighbour).weight);
+                // Neither side may shrink below the minimum. The bounds
+                // always straddle zero, which `clamp` requires.
+                let lowest = (MIN_WEIGHT * total - mine).min(0.0);
+                let highest = (theirs - MIN_WEIGHT * total).max(0.0);
+                let delta = (grow as f64 / space as f64 * total).clamp(lowest, highest);
+                self.node_mut(child).weight += delta;
+                self.node_mut(neighbour).weight -= delta;
+                return true;
             }
             child = parent;
         }
@@ -1327,11 +1410,19 @@ impl Tree {
         visit: &mut impl FnMut(NodeId, Rect),
     ) {
         visit(node, rect);
-        let n = self.node(node);
         let Some(axis) = self.container_axis(node) else {
             return;
         };
-        let count = n.children.len() as i32;
+        // Minimized windows (and splits holding only minimized windows)
+        // take no space; the rest share it.
+        let children: Vec<NodeId> = self
+            .node(node)
+            .children
+            .iter()
+            .copied()
+            .filter(|&c| self.is_shown(c))
+            .collect();
+        let count = children.len() as i32;
         if count == 0 {
             return;
         }
@@ -1340,13 +1431,13 @@ impl Tree {
             Axis::Vertical => rect.height,
         };
         let space = (along - inner * (count - 1)).max(0);
-        let total_weight: f64 = n.children.iter().map(|&c| self.node(c).weight).sum();
+        let total_weight: f64 = children.iter().map(|&c| self.node(c).weight).sum();
 
         // Place edges at rounded cumulative positions so rounding never
         // leaves stray pixels and the last child ends exactly at the edge.
         let mut cumulative = 0.0;
         let mut start = 0;
-        for (i, &child) in n.children.iter().enumerate() {
+        for (i, &child) in children.iter().enumerate() {
             cumulative += self.node(child).weight;
             let end = if i as i32 == count - 1 {
                 space
@@ -2249,6 +2340,95 @@ mod tests {
         assert_eq!(tree.monitor_by_id(MonitorId(2)), Some(tree.monitor_of(ws2)));
         assert_eq!(tree.monitor_by_id(MonitorId(1)), Some(tree.monitor_of(ws1)));
         assert_eq!(tree.monitor_by_id(MonitorId(9)), None);
+    }
+
+    #[test]
+    fn minimized_window_gives_up_space_and_comes_back_in_place() {
+        // H[1 V[2 3]] with 1 widened.
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        tree.split(w(2), Axis::Vertical);
+        open(&mut tree, ws, &[3]);
+        tree.resize(w(1), Axis::Horizontal, 0.1);
+        let before = tree.arrange(ws, Gaps::default());
+
+        assert!(tree.set_minimized(w(2), true));
+        let rects = tree.arrange(ws, Gaps::default());
+        assert_eq!(rects.len(), 2, "minimized window isn't placed");
+        // 3 takes the whole right column; 1 is unchanged.
+        assert_eq!(rects[0], before[0]);
+        assert_eq!(rects[1], (w(3), Rect::new(600, 0, 400, 500)));
+        assert!(tree.is_minimized(w(2)));
+        assert_eq!(tree.workspace_windows(ws).len(), 3, "still managed");
+
+        assert!(tree.set_minimized(w(2), false));
+        assert_eq!(tree.arrange(ws, Gaps::default()), before);
+        assert!(!tree.set_minimized(w(2), false), "already restored");
+    }
+
+    #[test]
+    fn minimizing_moves_focus_and_ends_fullscreen() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        tree.toggle_fullscreen(w(2));
+        tree.set_minimized(w(2), true);
+        assert_eq!(tree.focused_window(), Some(w(1)));
+        assert_eq!(tree.fullscreen_window(ws), None);
+
+        tree.set_minimized(w(1), true);
+        assert_eq!(tree.focused_window(), None);
+        assert!(tree.arrange(ws, Gaps::default()).is_empty());
+    }
+
+    #[test]
+    fn layout_operations_skip_minimized_windows() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2, 3]);
+        tree.set_minimized(w(2), true);
+        tree.focus_window(w(1));
+        assert_eq!(tree.focus_in_direction(Direction::Right), Some(w(3)));
+
+        // Moving 3 left swaps with 1, past the hidden 2.
+        assert!(tree.move_in_direction(w(3), Direction::Left));
+        assert_eq!(tree.debug_layout(ws), "H[3 2 1]");
+
+        // Dragging 3's right edge resizes 1, not the hidden 2.
+        let gaps = Gaps::default();
+        assert!(tree.resize_edge(w(3), Direction::Right, 100, gaps));
+        let widths: Vec<i32> = tree
+            .arrange(ws, gaps)
+            .iter()
+            .map(|(_, r)| r.width)
+            .collect();
+        assert_eq!(widths, [600, 400]);
+    }
+
+    #[test]
+    fn new_windows_avoid_minimized_ones() {
+        let (mut tree, ws) = setup();
+        tree.set_workspace_layout(ws, Layout::Dwindle);
+        open(&mut tree, ws, &[1, 2]);
+        tree.set_minimized(w(2), true);
+        // Focus fell back to 1, so the new window splits 1 (now the whole
+        // screen, so side by side), not the hidden 2.
+        open(&mut tree, ws, &[3]);
+        assert_eq!(tree.debug_layout(ws), "H[H[1 3] 2]");
+
+        tree.set_minimized(w(3), true);
+        tree.set_minimized(w(1), true);
+        // Nothing shown to split: it just goes in.
+        open(&mut tree, ws, &[4]);
+        assert_eq!(tree.arrange(ws, Gaps::default()).len(), 1);
+    }
+
+    #[test]
+    fn minimized_floats_arent_positioned() {
+        let (mut tree, ws) = setup();
+        tree.insert_floating(ws, w(1), Rect::new(0, 0, 10, 10));
+        tree.set_minimized(w(1), true);
+        assert!(tree.floating_windows(ws).is_empty());
+        tree.set_minimized(w(1), false);
+        assert_eq!(tree.floating_windows(ws).len(), 1);
     }
 
     #[test]

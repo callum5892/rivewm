@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, RuleAction};
+use crate::persist::{self, Identity, SavedState};
 use crate::subscribe::{Snapshot, WorkspaceSnapshot};
 
 /// Every window we currently manage, kept outside `Wm` so the Ctrl+C handler
@@ -29,6 +30,12 @@ static MANAGED: Mutex<BTreeSet<WindowId>> = Mutex::new(BTreeSet::new());
 
 /// Windows we have cloaked, mirrored to disk for crash recovery.
 static CLOAKED: Mutex<BTreeSet<WindowId>> = Mutex::new(BTreeSet::new());
+
+/// How often to check the cursor when focus follows the mouse.
+const MOUSE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long after a change to save the layout (see `persist`).
+const SAVE_DELAY: Duration = Duration::from_secs(2);
 
 /// Shortest time between live-resize steps (about 33 a second).
 const LIVE_RESIZE_INTERVAL: Duration = Duration::from_millis(30);
@@ -62,6 +69,14 @@ pub struct Wm {
     unmovable: HashSet<WindowId>,
     /// The window being dragged with the mouse, if any.
     drag: Option<Drag>,
+    /// What each managed window is, for recognising it after a restart.
+    identities: HashMap<WindowId, Identity>,
+    /// When to next save the layout, if it has changed.
+    save_at: Option<Instant>,
+    /// Where the cursor was at the last focus-follows-mouse check.
+    last_cursor: Option<(i32, i32)>,
+    /// When to next check the cursor, if focus follows the mouse.
+    mouse_poll_at: Instant,
     /// The window currently wearing the focused border colour.
     bordered: Option<WindowId>,
     /// The window that wore it before, which should now be unfocused-coloured.
@@ -102,12 +117,17 @@ impl Wm {
     pub fn new(config: Config) -> Self {
         let mut tree = Tree::new();
         tree.set_default_layout(config.default_layout);
-        for (i, spec) in monitor_specs().iter().enumerate() {
-            let monitor = tree.add_monitor(spec);
-            tree.add_workspace(monitor, (i + 1).to_string(), config.default_layout);
+        // Workspaces come in `manage_existing`, from the saved layout or
+        // fresh.
+        for spec in monitor_specs() {
+            tree.add_monitor(&spec);
             info!(device = spec.name, work_area = %spec.work_area, "added monitor");
         }
         Self {
+            identities: HashMap::new(),
+            save_at: None,
+            last_cursor: rivewm_platform::cursor_position(),
+            mouse_poll_at: Instant::now(),
             tree,
             config,
             fullscreen: BTreeSet::new(),
@@ -129,6 +149,7 @@ impl Wm {
         if !self.tree.sync_monitors(&specs) {
             return;
         }
+        self.mark_dirty();
         info!(
             monitors = ?specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             "monitors changed"
@@ -179,26 +200,131 @@ impl Wm {
 
     /// Manages every window that's already open, keeping tiled windows on
     /// their monitor in their left-to-right order.
+    ///
+    /// If a layout was saved by the last run, windows that still exist go
+    /// back exactly where they were (same workspaces, splits, sizes and
+    /// floating positions); anything else is managed as if newly opened.
     pub fn manage_existing(&mut self) {
         let mut windows: Vec<_> = rivewm_platform::enumerate_windows()
             .into_iter()
-            .filter(|w| w.is_manageable() && !w.minimized)
+            .filter(|w| w.is_manageable())
             .collect();
         windows.sort_by_key(|w| (w.frame.x, w.frame.y));
 
-        for w in windows {
-            self.manage(&w, true);
+        match persist::load() {
+            Some(saved) if !saved.workspaces.is_empty() => {
+                let by_id: HashMap<WindowId, &WindowInfo> =
+                    windows.iter().map(|w| (w.id, w)).collect();
+                // A window only counts as the saved one if its process and
+                // class still match; Windows reuses handles.
+                let placed = self.tree.restore_layout(&saved.workspaces, |id| {
+                    let info = by_id.get(&id)?;
+                    let identity = Identity {
+                        process: info.process.clone(),
+                        class: info.class.clone(),
+                    };
+                    (saved.identity(id) == Some(&identity)).then_some(info.minimized)
+                });
+                info!(restored = placed.len(), "restored saved layout");
+                for id in placed {
+                    self.adopt(by_id[&id]);
+                }
+            }
+            _ => {
+                let monitors: Vec<_> = self.tree.monitors().collect();
+                for (i, monitor) in monitors.into_iter().enumerate() {
+                    let layout = self.config.default_layout;
+                    self.tree
+                        .add_workspace(monitor, (i + 1).to_string(), layout);
+                }
+            }
         }
-        if let Some(fg) = rivewm_platform::foreground_window() {
-            self.tree.focus_window(fg);
+
+        for w in &windows {
+            if self.tree.contains_window(w.id) {
+                continue;
+            }
+            // Minimized windows are managed too, so they come back to a
+            // proper place when restored.
+            if self.manage(w, true).is_some() && w.minimized {
+                self.tree.set_minimized(w.id, true);
+            }
         }
+
         self.apply_all();
+        // Follow whatever actually has focus, bringing its workspace forward
+        // if the restored layout had it hidden.
+        if let Some(fg) = rivewm_platform::foreground_window()
+            && let Some(ws) = self.workspace_of(fg)
+        {
+            if self.tree.is_workspace_active(ws) {
+                self.tree.focus_window(fg);
+            } else {
+                self.tree.remember_focus(fg);
+                self.show_workspace(ws);
+            }
+        }
         self.sync_border();
+        self.save();
+    }
+
+    /// Focus follows mouse: if the cursor has moved onto a different managed
+    /// window, focus it. Doing nothing while the cursor is still means a
+    /// keyboard focus change isn't immediately undone by wherever the
+    /// cursor happens to rest.
+    fn focus_under_mouse(&mut self) {
+        let Some(pos) = rivewm_platform::cursor_position() else {
+            return;
+        };
+        if self.last_cursor == Some(pos) {
+            return;
+        }
+        self.last_cursor = Some(pos);
+        // Not while dragging, selecting text, or holding a menu open.
+        if self.drag.is_some() || rivewm_platform::mouse_button_down() {
+            return;
+        }
+        let Some(id) = rivewm_platform::window_at(pos.0, pos.1) else {
+            return;
+        };
+        let visible = self
+            .workspace_of(id)
+            .is_some_and(|ws| self.tree.is_workspace_active(ws));
+        if !visible
+            || self.tree.is_minimized(id)
+            || rivewm_platform::foreground_window() == Some(id)
+        {
+            return;
+        }
+        debug!(window = format_args!("{:#x}", id.0), "focus follows mouse");
+        self.tree.focus_window(id);
+        focus_os_window(id);
+        self.sync_border();
+    }
+
+    /// Notes that the layout changed, so it's saved shortly (once things
+    /// settle) rather than on every event.
+    fn mark_dirty(&mut self) {
+        if self.save_at.is_none() {
+            self.save_at = Some(Instant::now() + SAVE_DELAY);
+        }
+    }
+
+    /// Writes the layout so the next start can restore it.
+    pub fn save(&mut self) {
+        self.save_at = None;
+        let workspaces = self.tree.save_layout();
+        let state = SavedState::new(workspaces, self.identities.clone());
+        match persist::save(&state) {
+            Ok(()) => debug!("saved layout"),
+            Err(err) => warn!("{err:#}"),
+        }
     }
 
     /// Runs a user command. Returns `Break` when the WM should exit.
     pub fn execute(&mut self, command: Command) -> ControlFlow<()> {
         let flow = self.run(command);
+        self.mark_dirty();
         self.sync_fullscreen();
         self.release_refused();
         self.sync_border();
@@ -309,6 +435,13 @@ impl Wm {
     }
 
     pub fn handle(&mut self, event: WindowEvent) {
+        // Positions and titles change constantly and aren't saved anyway.
+        if !matches!(
+            event,
+            WindowEvent::LocationChanged(_) | WindowEvent::TitleChanged(_)
+        ) {
+            self.mark_dirty();
+        }
         self.on_event(event);
         self.sync_fullscreen();
         self.release_refused();
@@ -318,6 +451,7 @@ impl Wm {
     fn on_event(&mut self, event: WindowEvent) {
         debug!(?event);
         match event {
+            WindowEvent::Restored(id) if self.tree.is_minimized(id) => self.restored(id),
             WindowEvent::Shown(id)
             | WindowEvent::Uncloaked(id)
             | WindowEvent::Restored(id)
@@ -327,7 +461,9 @@ impl Wm {
                 self.unmovable.remove(&id);
                 self.unmanage(id);
             }
-            WindowEvent::Hidden(id) | WindowEvent::Minimized(id) => self.unmanage(id),
+            WindowEvent::Minimized(id) if self.tree.contains_window(id) => self.minimized(id),
+            WindowEvent::Minimized(_) => {}
+            WindowEvent::Hidden(id) => self.unmanage(id),
             WindowEvent::Cloaked(id) => {
                 // Our own cloaking reports back here too. Only a window on a
                 // visible workspace that is *still* cloaked now (e.g. moved
@@ -354,6 +490,40 @@ impl Wm {
             }
             WindowEvent::LocationChanged(_) => {}
         }
+    }
+
+    /// A managed window was minimized: keep its place in the tree but let
+    /// the others close up over it.
+    fn minimized(&mut self, id: WindowId) {
+        if !self.tree.set_minimized(id, true) {
+            return;
+        }
+        debug!(window = format_args!("{:#x}", id.0), "minimized");
+        if let Some(ws) = self.workspace_of(id)
+            && self.tree.is_workspace_active(ws)
+        {
+            self.apply(ws);
+        }
+    }
+
+    /// A minimized window was restored: it goes back exactly where it was.
+    fn restored(&mut self, id: WindowId) {
+        if !self.tree.set_minimized(id, false) {
+            return;
+        }
+        debug!(window = format_args!("{:#x}", id.0), "restored");
+        let Some(ws) = self.workspace_of(id) else {
+            return;
+        };
+        if !self.tree.is_workspace_active(ws) {
+            // Restored from the taskbar onto a hidden workspace; the focus
+            // that follows will bring the workspace forward.
+            return;
+        }
+        if self.tree.is_floating(id) {
+            self.place_floating(id);
+        }
+        self.apply(ws);
     }
 
     fn on_focused(&mut self, id: WindowId) {
@@ -739,10 +909,17 @@ impl Wm {
 
     /// When [`Self::on_timer`] next needs to run, if at all.
     pub fn next_timer(&self) -> Option<Instant> {
-        [self.border_reasserts.last().copied(), self.live_resize_at]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.border_reasserts.last().copied(),
+            self.live_resize_at,
+            self.save_at,
+            self.config
+                .focus_follows_mouse
+                .then_some(self.mouse_poll_at),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Runs whatever timed work is due: a live-resize step, re-painting
@@ -752,6 +929,13 @@ impl Wm {
         if self.live_resize_at.is_some_and(|at| at <= now) {
             self.live_resize_at = None;
             self.live_resize_step();
+        }
+        if self.config.focus_follows_mouse && self.mouse_poll_at <= now {
+            self.mouse_poll_at = now + MOUSE_POLL_INTERVAL;
+            self.focus_under_mouse();
+        }
+        if self.save_at.is_some_and(|at| at <= now) {
+            self.save();
         }
         let mut due = false;
         while self.border_reasserts.last().is_some_and(|&at| at <= now) {
@@ -880,6 +1064,12 @@ impl Wm {
                 tree.node(m).children.iter().map(move |&ws| {
                     let mut windows = tree.arrange(ws, self.config.gaps);
                     windows.extend(tree.floating_windows(ws));
+                    // Minimized windows have no rect but are still here.
+                    for id in tree.workspace_windows(ws) {
+                        if tree.is_minimized(id) {
+                            windows.push((id, Rect::default()));
+                        }
+                    }
                     WorkspaceSnapshot {
                         name: tree.workspace_name(ws).to_owned(),
                         monitor: id,
@@ -906,11 +1096,17 @@ impl Wm {
             .arrange(ws, self.config.gaps)
             .into_iter()
             .collect();
+        let float_rects: HashMap<WindowId, Rect> =
+            self.tree.floating_windows(ws).into_iter().collect();
         let floating: Vec<Value> = self
             .tree
-            .floating_windows(ws)
+            .workspace_windows(ws)
             .into_iter()
-            .map(|(id, rect)| window_json(id, Some(rect), None))
+            .filter(|&id| self.tree.is_floating(id))
+            .map(|id| {
+                let rect = float_rects.get(&id).copied();
+                window_json(id, rect, None, self.tree.is_minimized(id))
+            })
             .collect();
         json!({
             "name": self.tree.workspace_name(ws),
@@ -925,7 +1121,9 @@ impl Wm {
     fn tiling_json(&self, node: NodeId, rects: &HashMap<WindowId, Rect>) -> Value {
         let n = self.tree.node(node);
         match n.kind {
-            NodeKind::Window { id, .. } => window_json(id, rects.get(&id).copied(), Some(n.weight)),
+            NodeKind::Window { id, minimized, .. } => {
+                window_json(id, rects.get(&id).copied(), Some(n.weight), minimized)
+            }
             _ => {
                 let axis = match self.tree.container_axis(node) {
                     Some(Axis::Horizontal) => "horizontal",
@@ -1001,21 +1199,38 @@ impl Wm {
         } else {
             self.tree.insert_window(ws, info.id);
         }
-        lock(&MANAGED).insert(info.id);
+        self.adopt(info);
+        Some(ws)
+    }
+
+    /// Bookkeeping for a window that has just been put in the tree, either
+    /// newly managed or restored from the saved layout: track it, hide it if
+    /// its workspace isn't shown, and apply on-top and border settings.
+    fn adopt(&mut self, info: &WindowInfo) {
+        let id = info.id;
+        let Some(ws) = self.workspace_of(id) else {
+            return;
+        };
+        lock(&MANAGED).insert(id);
+        self.identities.insert(
+            id,
+            Identity {
+                process: info.process.clone(),
+                class: info.class.clone(),
+            },
+        );
         info!(
-            window = format_args!("{:#x}", info.id.0),
+            window = format_args!("{:#x}", id.0),
             title = info.title,
-            floating,
+            floating = self.tree.is_floating(id),
             workspace = self.tree.workspace_name(ws),
             "managing"
         );
         if !self.tree.is_workspace_active(ws) {
-            // A rule sent it to a workspace that isn't shown.
-            cloak(info.id, true);
+            cloak(id, true);
         }
-        self.sync_topmost(info.id);
-        self.paint_border(info.id, self.config.border.unfocused);
-        Some(ws)
+        self.sync_topmost(id);
+        self.paint_border(id, self.config.border.unfocused);
     }
 
     fn unmanage(&mut self, id: WindowId) {
@@ -1023,6 +1238,8 @@ impl Wm {
             return;
         };
         lock(&MANAGED).remove(&id);
+        self.identities.remove(&id);
+        self.mark_dirty();
         // No longer in the tree, so this undoes any always-on-top of ours.
         self.sync_topmost(id);
         // Give it back its normal border. Fails harmlessly if it's gone.
@@ -1071,7 +1288,7 @@ impl Wm {
     }
 }
 
-fn window_json(id: WindowId, rect: Option<Rect>, weight: Option<f64>) -> Value {
+fn window_json(id: WindowId, rect: Option<Rect>, weight: Option<f64>, minimized: bool) -> Value {
     let info = rivewm_platform::query_window(id);
     json!({
         "type": "window",
@@ -1081,6 +1298,7 @@ fn window_json(id: WindowId, rect: Option<Rect>, weight: Option<f64>) -> Value {
         "class": info.as_ref().map(|w| w.class.as_str()),
         "rect": rect.map(rect_json),
         "weight": weight,
+        "minimized": minimized,
     })
 }
 

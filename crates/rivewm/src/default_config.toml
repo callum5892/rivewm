@@ -28,6 +28,12 @@ focused = "#33ccff"
 # Every other window rivewm manages.
 unfocused = "#595959"
 
+[focus]
+# Focus whichever window the mouse moves over, like Hyprland's
+# follow_mouse. Only reacts to the mouse moving, so focusing with the
+# keyboard isn't undone by a cursor resting on another window.
+follows_mouse = false
+
 [resize]
 # Resize neighbouring windows live while you drag a window's edge. Turn this
 # off if an app struggles to keep up (File Explorer can lag or glitch); the

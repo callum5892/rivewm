@@ -11,7 +11,8 @@ use std::str::FromStr;
 use crate::Gaps;
 use crate::tree::{Axis, NodeId, Tree};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Layout {
     /// i3 / GlazeWM style: new windows go next to the focused one, in the
     /// direction the user last chose with `split`.
@@ -92,7 +93,7 @@ impl Tree {
     fn dwindle_insert(&mut self, ws: NodeId, window: NodeId) {
         let target = self
             .workspace_focus(ws)
-            .filter(|&f| !self.node_is_floating(f))
+            .filter(|&f| !self.node_is_floating(f) && self.is_shown(f))
             .or_else(|| self.last_tiled_window(ws));
         let Some(target) = target else {
             let end = self.node(ws).children.len();

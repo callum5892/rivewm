@@ -7,15 +7,19 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetCursorPos,
-    GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetAncestor, GetClassNameW,
+    GetCursorPos, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
     GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IsIconic,
     IsWindow, IsWindowVisible, IsZoomed, SET_WINDOW_POS_FLAGS, SW_RESTORE, SW_SHOWNA,
     SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
     SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
     WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_THICKFRAME,
+    WS_THICKFRAME, WindowFromPoint,
 };
 use windows::core::BOOL;
 
@@ -216,10 +220,50 @@ pub fn is_window_cloaked(id: WindowId) -> bool {
     is_cloaked(hwnd(id))
 }
 
-/// Gives a window keyboard focus. Returns `false` if Windows refused, which
-/// its foreground-lock rules allow it to do.
+/// Gives a window keyboard focus. Returns `false` if Windows refused.
+///
+/// Windows only lets the process that received the last input take focus.
+/// After a hotkey that's us, but not after, say, the mouse merely moving. If
+/// the plain request is refused, briefly attach to the foreground window's
+/// input queue, which lets the request through.
 pub fn focus_window(id: WindowId) -> bool {
-    unsafe { SetForegroundWindow(hwnd(id)) }.as_bool()
+    let target = hwnd(id);
+    unsafe {
+        if SetForegroundWindow(target).as_bool() {
+            return true;
+        }
+        let foreground = GetForegroundWindow();
+        let theirs = GetWindowThreadProcessId(foreground, None);
+        let ours = GetCurrentThreadId();
+        if theirs == 0 || theirs == ours {
+            return false;
+        }
+        let attached = AttachThreadInput(ours, theirs, true).as_bool();
+        let focused = SetForegroundWindow(target).as_bool();
+        if attached {
+            let _ = AttachThreadInput(ours, theirs, false);
+        }
+        focused
+    }
+}
+
+/// The top-level window under a screen point, if any.
+pub fn window_at(x: i32, y: i32) -> Option<WindowId> {
+    unsafe {
+        let hit = WindowFromPoint(POINT { x, y });
+        if hit.is_invalid() {
+            return None;
+        }
+        let root = GetAncestor(hit, GA_ROOT);
+        (!root.is_invalid()).then_some(WindowId(root.0 as isize))
+    }
+}
+
+/// Whether any mouse button is held down right now.
+pub fn mouse_button_down() -> bool {
+    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]
+        .iter()
+        .any(|&key| unsafe { GetAsyncKeyState(key.0 as i32) } as u16 & 0x8000 != 0)
 }
 
 /// Positions a window so its *visible* frame lands exactly on `frame`.

@@ -123,7 +123,8 @@ so rivewm never waits on a slow client.
 ```
 
 `rect` is where rivewm places the window (for hidden workspaces, where it
-would go). `weight` is a node's share of its parent split.
+would go). `weight` is a node's share of its parent split. Minimized windows
+have `"minimized": true` and no `rect`.
 
 ## Driving rivewm from scripts or AI agents
 
