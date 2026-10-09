@@ -30,6 +30,18 @@ pub struct Config {
     pub focus_follows_mouse: bool,
     pub bindings: Vec<(Hotkey, Command)>,
     pub rules: Vec<Rule>,
+    pub programs: Programs,
+}
+
+/// Programs to start with rivewm and stop when it quits.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Programs {
+    /// Started every time rivewm starts.
+    pub exec: Vec<String>,
+    /// Started only the first time rivewm starts after logging in.
+    pub exec_once: Vec<String>,
+    /// Executable names (e.g. `Discord.exe`) stopped when rivewm quits.
+    pub stop_on_exit: Vec<String>,
 }
 
 /// Window border colours, applied to every managed window.
@@ -133,6 +145,15 @@ struct RawConfig {
     layout: Option<RawLayout>,
     keybindings: Option<BTreeMap<String, String>>,
     rules: Option<Vec<RawRule>>,
+    programs: Option<RawPrograms>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawPrograms {
+    exec: Option<Vec<String>>,
+    exec_once: Option<Vec<String>>,
+    stop_on_exit: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -266,6 +287,32 @@ pub fn parse(text: &str) -> Result<Config> {
         .map(|(i, raw)| rule(raw).with_context(|| format!("in rule #{}", i + 1)))
         .collect::<Result<_>>()?;
 
+    let user_programs = user.programs.unwrap_or_default();
+    let default_programs = defaults.programs.unwrap_or_default();
+    let programs = Programs {
+        exec: user_programs
+            .exec
+            .or(default_programs.exec)
+            .unwrap_or_default(),
+        exec_once: user_programs
+            .exec_once
+            .or(default_programs.exec_once)
+            .unwrap_or_default(),
+        stop_on_exit: user_programs
+            .stop_on_exit
+            .or(default_programs.stop_on_exit)
+            .unwrap_or_default(),
+    };
+    if let Some(name) = programs
+        .stop_on_exit
+        .iter()
+        .find(|n| !n.to_ascii_lowercase().ends_with(".exe"))
+    {
+        bail!(
+            "in [programs] stop_on_exit: `{name}` should be an executable name like \"{name}.exe\""
+        );
+    }
+
     Ok(Config {
         gaps,
         floating_on_top,
@@ -275,6 +322,7 @@ pub fn parse(text: &str) -> Result<Config> {
         focus_follows_mouse,
         bindings,
         rules,
+        programs,
     })
 }
 
@@ -390,6 +438,28 @@ mod tests {
         assert_eq!(manual.default_layout, Layout::Manual);
         let err = format!("{:#}", parse("[layout]\ndefault = \"spiral\"").unwrap_err());
         assert!(err.contains("spiral"));
+    }
+
+    #[test]
+    fn programs_section() {
+        assert_eq!(parse("").unwrap().programs, Programs::default());
+        let config = parse(
+            r#"
+            [programs]
+            exec = ["rivewm-bar"]
+            exec_once = ['"C:\a b\x.exe" -y']
+            stop_on_exit = ["rivewm-bar.exe"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.programs.exec, ["rivewm-bar"]);
+        assert_eq!(config.programs.exec_once, [r#""C:\a b\x.exe" -y"#]);
+        assert_eq!(config.programs.stop_on_exit, ["rivewm-bar.exe"]);
+        let err = format!(
+            "{:#}",
+            parse("[programs]\nstop_on_exit = [\"discord\"]").unwrap_err()
+        );
+        assert!(err.contains("discord.exe"), "{err}");
     }
 
     #[test]

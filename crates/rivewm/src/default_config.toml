@@ -28,6 +28,26 @@ focused = "#33ccff"
 # Every other window rivewm manages.
 unfocused = "#595959"
 
+[programs]
+# Programs to start with rivewm, as you'd type them in the Run dialog
+# (Win+R): a full path, something on PATH, or an app name like "wt".
+# %VARIABLES% are expanded. Put a path with spaces in double quotes, inside
+# single-quoted TOML: '"C:\Program Files\App\app.exe" --flag'
+#
+# Started every time rivewm starts. Good for things that belong with the
+# WM, like a status bar (list those in stop_on_exit too).
+exec = []
+# Started only the first time rivewm starts after you log in, so restarting
+# rivewm doesn't open them again.
+exec_once = []
+# Executable names (as in Task Manager's Details tab) to close when rivewm
+# quits. They're force-closed, so unsaved work in them is lost.
+stop_on_exit = []
+# For example:
+#   exec = ["rivewm-bar"]
+#   exec_once = ["wt", '%LOCALAPPDATA%\Discord\Update.exe --processStart Discord.exe']
+#   stop_on_exit = ["rivewm-bar.exe"]
+
 [focus]
 # Focus whichever window the mouse moves over, like Hyprland's
 # follow_mouse. Only reacts to the mouse moving, so focusing with the

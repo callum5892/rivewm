@@ -125,6 +125,11 @@ live = true                  # neighbours follow a dragged edge
 [floating]
 on_top = false               # keep floating windows above tiles
 
+[programs]
+exec = ["rivewm-bar"]        # started every time rivewm starts
+exec_once = ["wt"]           # only the first time after you log in
+stop_on_exit = ["rivewm-bar.exe"]  # force-closed when rivewm quits
+
 [keybindings]
 "alt+h" = "focus left"
 "alt+shift+1" = "move-to-workspace 1"
@@ -143,6 +148,10 @@ action = "float"
 A `[keybindings]` section replaces all the default bindings, so include
 every binding you want. `rivewm --list --all` shows each window's process
 and class, and whether rivewm manages it, which helps when writing rules.
+
+Programs are started as the Run dialog (`Win + R`) would start them, so app
+names like `wt`, `%VARIABLES%` and arguments all work. `stop_on_exit` takes
+executable names as shown in Task Manager's Details tab.
 
 ### Commands
 

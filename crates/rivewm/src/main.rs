@@ -1,6 +1,7 @@
 mod background;
 mod config;
 mod persist;
+mod programs;
 mod subscribe;
 mod wm;
 
@@ -194,6 +195,9 @@ fn run(config_path: &Path) -> Result<()> {
     wm::recover_cloaked();
     let mut wm = Wm::new(config);
     wm.manage_existing();
+    // After the existing windows, so these programs' windows arrive as new
+    // ones and are placed like any other.
+    programs::start(&wm.config().programs);
     tracing::info!("rivewm running. Alt+Shift+E or Ctrl+C to quit.");
 
     let mut app = App {
@@ -268,6 +272,7 @@ fn run(config_path: &Path) -> Result<()> {
     tracing::info!("shutting down");
     app.wm.save();
     wm::restore_all();
+    programs::stop(&app.wm.config().programs);
     Ok(())
 }
 

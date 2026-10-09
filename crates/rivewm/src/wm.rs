@@ -206,6 +206,10 @@ impl Wm {
 
     /// Swaps in a reloaded config. New gaps and the floating on-top setting
     /// apply immediately; rules apply to windows opened from now on.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
     pub fn set_config(&mut self, config: Config) {
         self.config = config;
         self.tree.set_default_layout(self.config.default_layout);

@@ -11,6 +11,7 @@ mod cloak;
 mod events;
 mod hotkey;
 pub mod ipc;
+pub mod launch;
 mod monitor;
 mod process;
 mod tray;
