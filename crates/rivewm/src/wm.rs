@@ -463,6 +463,15 @@ impl Wm {
                     self.apply(ws);
                 }
             }
+            Command::Close => {
+                // Only windows we manage: whatever else has focus (the
+                // desktop, the taskbar) shouldn't be closed by accident.
+                if let Some(id) = focused
+                    && let Err(err) = rivewm_platform::close_window(id)
+                {
+                    warn!(window = format_args!("{:#x}", id.0), %err, "failed to close window");
+                }
+            }
             Command::Exec(line) => crate::programs::launch(vec![line]),
             Command::Retile => {
                 // Re-learn minimum sizes from scratch, in case an app's

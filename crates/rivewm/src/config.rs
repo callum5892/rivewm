@@ -381,14 +381,14 @@ mod tests {
                 .bindings
                 .contains(&(focus_left, Command::Focus(Direction::Left)))
         );
-        assert_eq!(config.bindings.len(), 49);
+        assert_eq!(config.bindings.len(), 50);
     }
 
     #[test]
     fn missing_sections_fall_back_to_defaults() {
         let config = parse("[gaps]\ninner = 2\n").unwrap();
         assert_eq!(config.gaps, Gaps { inner: 2, outer: 8 });
-        assert_eq!(config.bindings.len(), 49);
+        assert_eq!(config.bindings.len(), 50);
     }
 
     #[test]

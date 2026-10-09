@@ -41,6 +41,7 @@ Any command from the config file's `[keybindings]` section:
 | `toggle-split`                | Same, alternating axis                                      |
 | `toggle-floating`             | Float or tile the focused window                            |
 | `toggle-fullscreen`           | Make the focused window cover its monitor, or undo it       |
+| `close`                       | Close the focused window, as its X button would             |
 | `layout <dwindle/manual>`     | Change how new windows are placed on the focused workspace  |
 | `resize <direction> N`        | Move the focused window's edge that way by N% of the monitor |
 | `resize <width/height> <±N>`  | Grow/shrink the focused window by N% of its container       |

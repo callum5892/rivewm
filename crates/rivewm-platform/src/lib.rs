@@ -23,10 +23,10 @@ pub use hotkey::{Hotkey, ParseHotkeyError};
 pub use monitor::{MonitorInfo, monitors};
 pub use tray::{TrayAction, open_file};
 pub use window::{
-    BorderColor, Skip, WindowInfo, cursor_position, enumerate_windows, focus_desktop, focus_window,
-    foreground_window, frame, is_topmost, is_window_cloaked, mouse_button_down, query_window,
-    raise_window, set_border_color, set_frame, set_frame_redraw, set_topmost, show_window, title,
-    window_at,
+    BorderColor, Skip, WindowInfo, close_window, cursor_position, enumerate_windows, focus_desktop,
+    focus_window, foreground_window, frame, is_topmost, is_window_cloaked, mouse_button_down,
+    query_window, raise_window, set_border_color, set_frame, set_frame_redraw, set_topmost,
+    show_window, title, window_at,
 };
 
 use windows::Win32::UI::HiDpi::{

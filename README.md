@@ -89,6 +89,7 @@ menu, or Ctrl+C; every window rivewm hid is shown again on the way out.
 | `Alt + Shift + Space` | Toggle floating |
 | `Alt + F` | Toggle fullscreen |
 | `Alt + Enter` | Open a terminal (Windows Terminal) |
+| `Alt + Shift + Q` | Close the focused window |
 | `Alt + Shift + R` | Re-tile everything |
 | `Alt + Shift + C` | Reload the config |
 | `Alt + Shift + E` | Quit |
@@ -166,6 +167,7 @@ Key bindings, IPC requests and `rivewm msg` all use the same commands:
 | `move-to-workspace <name>` | Send the focused window to a workspace |
 | `split <horizontal/vertical>`, `toggle-split` | Choose the split direction |
 | `toggle-floating`, `toggle-fullscreen` | |
+| `close` | Close the focused window, like Alt+F4 |
 | `resize <left/right/up/down> N` | Move an edge that way by N% of the monitor |
 | `resize <width/height> <+N/-N>` | Resize by N% of the containing split |
 | `layout <dwindle/manual>` | Change the focused workspace's layout |

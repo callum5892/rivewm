@@ -15,11 +15,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetAncestor, GetClassNameW,
     GetCursorPos, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
     GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IsIconic,
-    IsWindow, IsWindowVisible, IsZoomed, SET_WINDOW_POS_FLAGS, SW_RESTORE, SW_SHOWNA,
-    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-    SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_THICKFRAME, WindowFromPoint,
+    IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SC_CLOSE, SET_WINDOW_POS_FLAGS, SW_RESTORE,
+    SW_SHOWNA, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_SYSCOMMAND, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_THICKFRAME, WindowFromPoint,
 };
 use windows::core::BOOL;
 
@@ -308,6 +308,19 @@ fn position(id: WindowId, frame: Rect, extra: SET_WINDOW_POS_FLAGS) -> windows::
             frame.width + left + right,
             frame.height + top + bottom,
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS | extra,
+        )
+    }
+}
+
+/// Asks a window to close, as clicking its X or pressing Alt+F4 would, so
+/// the app can still ask about unsaved work.
+pub fn close_window(id: WindowId) -> windows::core::Result<()> {
+    unsafe {
+        PostMessageW(
+            Some(hwnd(id)),
+            WM_SYSCOMMAND,
+            windows::Win32::Foundation::WPARAM(SC_CLOSE as usize),
+            windows::Win32::Foundation::LPARAM(0),
         )
     }
 }

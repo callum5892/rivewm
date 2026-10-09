@@ -19,6 +19,7 @@ use crate::{Axis, Direction, Layout, WindowId};
 /// | `toggle-split`                    | `ToggleSplit`                 |
 /// | `toggle-floating`                 | `ToggleFloating`              |
 /// | `toggle-fullscreen`               | `ToggleFullscreen`            |
+/// | `close`                           | `Close`                       |
 /// | `layout dwindle`                  | `SetLayout(Dwindle)`          |
 /// | `resize width +5`                 | grow width by 5% of container |
 /// | `resize height -5`                | shrink height by 5%           |
@@ -48,6 +49,8 @@ pub enum Command {
     /// Make the focused window cover its whole monitor, or return it to
     /// normal.
     ToggleFullscreen,
+    /// Close the focused window, as its X button would.
+    Close,
     /// Change how new windows are placed on the focused workspace.
     SetLayout(Layout),
     /// Grow (positive) or shrink the focused window by a fraction of its
@@ -161,6 +164,7 @@ impl FromStr for Command {
                     "toggle-split" => Command::ToggleSplit,
                     "toggle-floating" => Command::ToggleFloating,
                     "toggle-fullscreen" => Command::ToggleFullscreen,
+                    "close" => Command::Close,
                     "retile" => Command::Retile,
                     "reload-config" => Command::ReloadConfig,
                     "quit" => Command::Quit,
@@ -202,6 +206,7 @@ mod tests {
         assert_eq!(parse("toggle-split"), Command::ToggleSplit);
         assert_eq!(parse("toggle-floating"), Command::ToggleFloating);
         assert_eq!(parse("toggle-fullscreen"), Command::ToggleFullscreen);
+        assert_eq!(parse("close"), Command::Close);
         assert_eq!(parse("layout dwindle"), Command::SetLayout(Layout::Dwindle));
         assert_eq!(parse("layout manual"), Command::SetLayout(Layout::Manual));
         assert_eq!(
