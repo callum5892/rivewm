@@ -22,6 +22,8 @@ use crate::{Axis, Direction, Layout, WindowId};
 /// | `layout dwindle`                  | `SetLayout(Dwindle)`          |
 /// | `resize width +5`                 | grow width by 5% of container |
 /// | `resize height -5`                | shrink height by 5%           |
+/// | `resize right 5`                  | move an edge right by 5% of   |
+/// |                                   | the monitor                   |
 /// | `retile`, `reload-config`, `quit` | as named                      |
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -52,6 +54,14 @@ pub enum Command {
     Resize {
         axis: Axis,
         delta: f64,
+    },
+    /// Move one of the focused window's edges in a direction by a fraction
+    /// of the monitor: the edge on that side if there's a window beyond it
+    /// (growing), else the opposite edge (shrinking). The edge goes the way
+    /// the arrow points, whichever side of the screen the window is on.
+    ResizeToward {
+        direction: Direction,
+        amount: f64,
     },
     /// Re-apply the layout to every window.
     Retile,
@@ -114,17 +124,23 @@ impl FromStr for Command {
             }),
             Some("resize") => {
                 let a = args(2)?;
-                let axis = match a[0] {
-                    "width" => Axis::Horizontal,
-                    "height" => Axis::Vertical,
-                    _ => return Err(err("expected width or height")),
-                };
                 let percent: f64 = a[1]
                     .parse()
                     .map_err(|_| err("expected a percentage like +5 or -5"))?;
-                Command::Resize {
-                    axis,
-                    delta: percent / 100.0,
+                match a[0] {
+                    "width" => Command::Resize {
+                        axis: Axis::Horizontal,
+                        delta: percent / 100.0,
+                    },
+                    "height" => Command::Resize {
+                        axis: Axis::Vertical,
+                        delta: percent / 100.0,
+                    },
+                    other => Command::ResizeToward {
+                        direction: direction(other)
+                            .map_err(|_| err("expected width, height, left, right, up or down"))?,
+                        amount: percent / 100.0,
+                    },
                 }
             }
             Some(simple) => {
@@ -188,6 +204,13 @@ mod tests {
             Command::Resize {
                 axis: Axis::Vertical,
                 delta: -0.1
+            }
+        );
+        assert_eq!(
+            parse("resize left 5"),
+            Command::ResizeToward {
+                direction: Direction::Left,
+                amount: 0.05
             }
         );
         assert_eq!(parse("retile"), Command::Retile);

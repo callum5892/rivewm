@@ -42,8 +42,10 @@ Any command from the config file's `[keybindings]` section:
 | `toggle-floating`             | Float or tile the focused window                            |
 | `toggle-fullscreen`           | Make the focused window cover its monitor, or undo it       |
 | `layout <dwindle/manual>`     | Change how new windows are placed on the focused workspace  |
+| `resize <direction> N`        | Move the focused window's edge that way by N% of the monitor |
 | `resize <width/height> <±N>`  | Grow/shrink the focused window by N% of its container       |
-| `retile`, `reload-config`, `quit` | As named                                                |
+| `retile`                      | Re-apply the layout, forgetting learned minimum sizes       |
+| `reload-config`, `quit`       | As named                                                    |
 
 Commands act on the **focused** window, so to act on a specific window send
 `focus-window <id>` first.

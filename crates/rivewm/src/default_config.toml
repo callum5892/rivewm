@@ -58,6 +58,7 @@ on_top = false
 #   split <horizontal|vertical>     toggle-split
 #   toggle-floating                 toggle-fullscreen
 #   layout <dwindle|manual>
+#   resize <left|right|up|down> N   (move an edge that way, percent of monitor)
 #   resize <width|height> <+N|-N>   (percent of the containing split)
 #   retile                          reload-config
 #   quit
@@ -88,14 +89,14 @@ on_top = false
 "alt+shift+space" = "toggle-floating"
 "alt+f" = "toggle-fullscreen"
 
-"alt+ctrl+l" = "resize width +5"
-"alt+ctrl+h" = "resize width -5"
-"alt+ctrl+j" = "resize height +5"
-"alt+ctrl+k" = "resize height -5"
-"alt+ctrl+right" = "resize width +5"
-"alt+ctrl+left" = "resize width -5"
-"alt+ctrl+down" = "resize height +5"
-"alt+ctrl+up" = "resize height -5"
+"alt+ctrl+l" = "resize right 5"
+"alt+ctrl+h" = "resize left 5"
+"alt+ctrl+j" = "resize down 5"
+"alt+ctrl+k" = "resize up 5"
+"alt+ctrl+right" = "resize right 5"
+"alt+ctrl+left" = "resize left 5"
+"alt+ctrl+down" = "resize down 5"
+"alt+ctrl+up" = "resize up 5"
 
 "alt+1" = "workspace 1"
 "alt+2" = "workspace 2"

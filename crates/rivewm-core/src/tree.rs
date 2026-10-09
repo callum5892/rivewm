@@ -55,6 +55,15 @@ impl Direction {
             Direction::Up | Direction::Down => Axis::Vertical,
         }
     }
+
+    pub fn opposite(self) -> Self {
+        match self {
+            Direction::Left => Direction::Right,
+            Direction::Right => Direction::Left,
+            Direction::Up => Direction::Down,
+            Direction::Down => Direction::Up,
+        }
+    }
 }
 
 /// Split sizes captured by [`Tree::save_weights`].
@@ -143,6 +152,9 @@ pub struct Tree {
     /// Layout for workspaces the tree creates itself (e.g. for a newly
     /// connected monitor).
     default_layout: Layout,
+    /// Smallest (width, height) each window has refused to go below. Tiles
+    /// are kept at least this big where the space allows.
+    min_sizes: HashMap<WindowId, (i32, i32)>,
 }
 
 impl Default for Tree {
@@ -166,6 +178,7 @@ impl Tree {
             windows: HashMap::new(),
             focused_workspace: None,
             default_layout: Layout::default(),
+            min_sizes: HashMap::new(),
         }
     }
 
@@ -850,6 +863,7 @@ impl Tree {
     /// moves focus to its nearest sibling. Returns its workspace.
     pub fn remove_window(&mut self, window: WindowId) -> Option<NodeId> {
         let node = self.windows.remove(&window)?;
+        self.min_sizes.remove(&window);
         let ws = self.unlink_window(node);
         self.release(node);
         self.layout_after_remove(ws);
@@ -1281,6 +1295,29 @@ impl Tree {
     /// column), the split's boundary moves instead.
     ///
     /// Returns `false` if nothing lies across that edge (it's the monitor's).
+    /// Moves an edge of a tiled window `amount` of its monitor's work area
+    /// towards `direction`: the edge on that side if anything lies beyond
+    /// it, so the window grows, otherwise the opposite edge, so it shrinks.
+    pub fn resize_toward(
+        &mut self,
+        window: WindowId,
+        direction: Direction,
+        amount: f64,
+        gaps: Gaps,
+    ) -> bool {
+        let Some(ws) = self.window_node(window).and_then(|n| self.workspace_of(n)) else {
+            return false;
+        };
+        let area = self.monitor_work_area(self.monitor_of(ws));
+        let along = match direction.axis() {
+            Axis::Horizontal => area.width,
+            Axis::Vertical => area.height,
+        };
+        let pixels = (along as f64 * amount).round() as i32;
+        self.resize_edge(window, direction, pixels, gaps)
+            || self.resize_edge(window, direction.opposite(), -pixels, gaps)
+    }
+
     pub fn resize_edge(
         &mut self,
         window: WindowId,
@@ -1354,6 +1391,169 @@ impl Tree {
     }
 
     // ---- Geometry ----------------------------------------------------------
+
+    /// Records that `window` won't shrink below `width` x `height` (either
+    /// may be 0 for no limit). Limits only ever grow; returns whether this
+    /// one did.
+    pub fn raise_min_size(&mut self, window: WindowId, width: i32, height: i32) -> bool {
+        if !self.windows.contains_key(&window) {
+            return false;
+        }
+        let min = self.min_sizes.entry(window).or_default();
+        let raised = (min.0.max(width), min.1.max(height));
+        let grew = raised != *min;
+        *min = raised;
+        grew
+    }
+
+    /// Forgets every recorded minimum size.
+    pub fn clear_min_sizes(&mut self) {
+        self.min_sizes.clear();
+    }
+
+    /// The least space `node` needs along `axis`: its own minimum for a
+    /// window; for a container, its children's minimums plus the gaps
+    /// between them if they're laid out along `axis`, else the largest.
+    fn min_along(&self, node: NodeId, axis: Axis, inner: i32) -> i32 {
+        match self.node(node).kind {
+            NodeKind::Window { id, .. } => {
+                self.min_sizes.get(&id).map_or(0, |&(w, h)| match axis {
+                    Axis::Horizontal => w,
+                    Axis::Vertical => h,
+                })
+            }
+            _ => {
+                let shown = self
+                    .node(node)
+                    .children
+                    .iter()
+                    .copied()
+                    .filter(|&c| self.is_shown(c));
+                if self.container_axis(node) == Some(axis) {
+                    let (sum, count) = shown.fold((0, 0), |(sum, count), c| {
+                        (sum + self.min_along(c, axis, inner), count + 1)
+                    });
+                    sum + inner * (count - 1).max(0)
+                } else {
+                    shown
+                        .map(|c| self.min_along(c, axis, inner))
+                        .max()
+                        .unwrap_or(0)
+                }
+            }
+        }
+    }
+
+    /// Divides `space` between `children` purely by weight.
+    fn weighted_lengths(&self, children: &[NodeId], space: i32) -> Vec<i32> {
+        let total_weight: f64 = children.iter().map(|&c| self.node(c).weight).sum();
+        // Place edges at rounded cumulative positions so rounding never
+        // leaves stray pixels and the last child ends exactly at the edge.
+        let mut cumulative = 0.0;
+        let mut start = 0;
+        children
+            .iter()
+            .enumerate()
+            .map(|(i, &child)| {
+                cumulative += self.node(child).weight;
+                let end = if i == children.len() - 1 {
+                    space
+                } else {
+                    (cumulative / total_weight * space as f64).round() as i32
+                };
+                let length = end - start;
+                start = end;
+                length
+            })
+            .collect()
+    }
+
+    /// Wherever a minimum size is overriding the weights in `ws`, changes
+    /// the weights to match what's shown. Call after a resize, so pushing
+    /// past a minimum doesn't leave a hidden excess that a resize the other
+    /// way must first undo.
+    pub fn fit_weights_to_min_sizes(&mut self, ws: NodeId, gaps: Gaps) {
+        let rects = self.node_rects(ws, gaps);
+        for (node, rect) in rects {
+            let Some(axis) = self.container_axis(node) else {
+                continue;
+            };
+            let children: Vec<NodeId> = self
+                .node(node)
+                .children
+                .iter()
+                .copied()
+                .filter(|&c| self.is_shown(c))
+                .collect();
+            let along = match axis {
+                Axis::Horizontal => rect.width,
+                Axis::Vertical => rect.height,
+            };
+            let space = along - gaps.inner * (children.len() as i32 - 1);
+            if children.is_empty() || space <= 0 {
+                continue;
+            }
+            let lengths = self.child_lengths(&children, axis, space, gaps.inner);
+            if lengths == self.weighted_lengths(&children, space) {
+                continue;
+            }
+            // Only this container's own weights change, so the rects
+            // already worked out for the others stay right.
+            let total: f64 = children.iter().map(|&c| self.node(c).weight).sum();
+            for (&child, length) in children.iter().zip(lengths) {
+                self.node_mut(child).weight = total * length as f64 / space as f64;
+            }
+        }
+    }
+
+    /// Divides `space` between `children` by weight, then grows any child
+    /// below its minimum at the expense of those with room to spare. If the
+    /// minimums can't all fit, the plain weighted sizes are kept and the
+    /// windows that refuse them overlap their neighbours.
+    fn child_lengths(&self, children: &[NodeId], axis: Axis, space: i32, inner: i32) -> Vec<i32> {
+        let mut lengths = self.weighted_lengths(children, space);
+
+        let mins: Vec<i32> = children
+            .iter()
+            .map(|&c| self.min_along(c, axis, inner))
+            .collect();
+        if mins.iter().sum::<i32>() > space {
+            return lengths;
+        }
+        let deficit: i32 = lengths
+            .iter()
+            .zip(&mins)
+            .map(|(&l, &m)| (m - l).max(0))
+            .sum();
+        if deficit == 0 {
+            return lengths;
+        }
+        // Take the deficit from each child in proportion to how far it is
+        // above its minimum, then hand any rounding remainder to the last.
+        let slack: Vec<i32> = lengths
+            .iter()
+            .zip(&mins)
+            .map(|(&l, &m)| (l - m).max(0))
+            .collect();
+        let total_slack: i32 = slack.iter().sum();
+        let mut taken = 0;
+        for (i, length) in lengths.iter_mut().enumerate() {
+            if *length < mins[i] {
+                *length = mins[i];
+            } else {
+                let share = (deficit as i64 * slack[i] as i64 / total_slack as i64) as i32;
+                *length -= share;
+                taken += share;
+            }
+        }
+        let mut remainder = deficit - taken;
+        for (i, length) in lengths.iter_mut().enumerate().rev() {
+            let give = remainder.min(*length - mins[i]).max(0);
+            *length -= give;
+            remainder -= give;
+        }
+        lengths
+    }
 
     /// Computes where every tiled window in a workspace should go. A
     /// fullscreen one gets the monitor's bounds; the rest keep their tiles.
@@ -1431,26 +1631,16 @@ impl Tree {
             Axis::Vertical => rect.height,
         };
         let space = (along - inner * (count - 1)).max(0);
-        let total_weight: f64 = children.iter().map(|&c| self.node(c).weight).sum();
+        let lengths = self.child_lengths(&children, axis, space, inner);
 
-        // Place edges at rounded cumulative positions so rounding never
-        // leaves stray pixels and the last child ends exactly at the edge.
-        let mut cumulative = 0.0;
-        let mut start = 0;
-        for (i, &child) in children.iter().enumerate() {
-            cumulative += self.node(child).weight;
-            let end = if i as i32 == count - 1 {
-                space
-            } else {
-                (cumulative / total_weight * space as f64).round() as i32
-            };
-            let offset = start + inner * i as i32;
+        let mut offset = 0;
+        for (&child, length) in children.iter().zip(lengths) {
             let child_rect = match axis {
-                Axis::Horizontal => Rect::new(rect.x + offset, rect.y, end - start, rect.height),
-                Axis::Vertical => Rect::new(rect.x, rect.y + offset, rect.width, end - start),
+                Axis::Horizontal => Rect::new(rect.x + offset, rect.y, length, rect.height),
+                Axis::Vertical => Rect::new(rect.x, rect.y + offset, rect.width, length),
             };
             self.layout_node(child, child_rect, inner, visit);
-            start = end;
+            offset += length + inner;
         }
     }
 
@@ -1816,6 +2006,84 @@ mod tests {
                 (w(2), Rect::new(500, 0, 500, 500))
             ]
         );
+    }
+
+    #[test]
+    fn min_size_takes_space_from_siblings() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2, 3]);
+        assert!(tree.raise_min_size(w(1), 600, 0));
+        assert!(!tree.raise_min_size(w(1), 500, 0));
+        // The 400px left over is split (give or take rounding) evenly
+        // between 2 and 3.
+        let rects = tree.arrange(ws, Gaps::default());
+        assert_eq!(rects[0].1, Rect::new(0, 0, 600, 500));
+        let (a, b) = (rects[1].1, rects[2].1);
+        assert_eq!(
+            (a.x, a.right(), b.x, b.right()),
+            (600, a.x + a.width, a.right(), 1000)
+        );
+        assert!((a.width - b.width).abs() <= 2);
+    }
+
+    #[test]
+    fn nested_min_size_reaches_the_outer_split() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        tree.split(w(2), Axis::Vertical);
+        open(&mut tree, ws, &[3]);
+        assert_eq!(tree.debug_layout(ws), "H[1 V[2 3]]");
+        tree.raise_min_size(w(3), 700, 300);
+        let rects = tree.arrange(ws, Gaps::default());
+        assert_eq!(rects[0].1, Rect::new(0, 0, 300, 500));
+        assert_eq!(rects[1].1, Rect::new(300, 0, 700, 200));
+        assert_eq!(rects[2].1, Rect::new(300, 200, 700, 300));
+    }
+
+    #[test]
+    fn shrinking_past_a_min_size_leaves_nothing_to_undo() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        tree.raise_min_size(w(1), 400, 0);
+        for _ in 0..5 {
+            tree.resize(w(1), Axis::Horizontal, -0.1);
+            tree.fit_weights_to_min_sizes(ws, Gaps::default());
+        }
+        assert_eq!(tree.arrange(ws, Gaps::default())[0].1.width, 400);
+        // The very next press grows it.
+        tree.resize(w(1), Axis::Horizontal, 0.1);
+        tree.fit_weights_to_min_sizes(ws, Gaps::default());
+        assert_eq!(tree.arrange(ws, Gaps::default())[0].1.width, 500);
+        weights_sum_to_one(&tree, ws);
+    }
+
+    #[test]
+    fn resize_toward_moves_the_edge_the_arrow_points() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        // The left window grows to the right...
+        assert!(tree.resize_toward(w(1), Direction::Right, 0.1, Gaps::default()));
+        assert_eq!(tree.arrange(ws, Gaps::default())[0].1.width, 600);
+        // ...and the right window, pushed right, shrinks.
+        assert!(tree.resize_toward(w(2), Direction::Right, 0.1, Gaps::default()));
+        assert_eq!(tree.arrange(ws, Gaps::default())[0].1.width, 700);
+        // Pushed left, it grows again.
+        assert!(tree.resize_toward(w(2), Direction::Left, 0.2, Gaps::default()));
+        assert_eq!(tree.arrange(ws, Gaps::default())[0].1.width, 500);
+        // Nothing above or below to give way.
+        assert!(!tree.resize_toward(w(1), Direction::Up, 0.1, Gaps::default()));
+    }
+
+    #[test]
+    fn min_sizes_that_cant_fit_are_ignored() {
+        let (mut tree, ws) = setup();
+        open(&mut tree, ws, &[1, 2]);
+        tree.raise_min_size(w(1), 600, 0);
+        tree.raise_min_size(w(2), 600, 0);
+        assert_eq!(tree.arrange(ws, Gaps::default())[0].1.width, 500);
+        tree.remove_window(w(2));
+        open(&mut tree, ws, &[2]);
+        assert_eq!(tree.arrange(ws, Gaps::default())[0].1.width, 600);
     }
 
     #[test]

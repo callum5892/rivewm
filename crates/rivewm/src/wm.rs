@@ -51,6 +51,12 @@ fn was_resized(start: Rect, frame: Rect) -> bool {
         || (frame.height - start.height).abs() > DRAG_SLACK
 }
 
+/// How long after positioning a tiled window to check whether it came out
+/// bigger than its tile (i.e. it has a minimum size). Apps apply our moves
+/// asynchronously, so this gives them time to catch up with every move
+/// we've asked for.
+const MIN_SIZE_SETTLE: Duration = Duration::from_millis(400);
+
 /// How long after a focus change to paint borders again (see `sync_border`).
 const BORDER_REASSERT_DELAYS: [u64; 3] = [80, 250, 800];
 
@@ -67,6 +73,9 @@ pub struct Wm {
     refused: RefCell<Vec<WindowId>>,
     /// Windows released for that reason, so they aren't managed again.
     unmovable: HashSet<WindowId>,
+    /// Tiled windows we've positioned and will check fit their tiles (see
+    /// [`MIN_SIZE_SETTLE`]).
+    positioned: RefCell<HashMap<WindowId, SizeCheck>>,
     /// The window being dragged with the mouse, if any.
     drag: Option<Drag>,
     /// What each managed window is, for recognising it after a restart.
@@ -103,6 +112,17 @@ struct Drag {
     last_step: Option<Instant>,
 }
 
+/// A pending check that a tiled window fit the tile we gave it.
+#[derive(Clone, Copy)]
+struct SizeCheck {
+    tile: Rect,
+    due: Instant,
+    /// Whether it already didn't fit once and was asked again. Only a
+    /// second refusal counts: the first may just be the app resizing
+    /// itself (e.g. restoring its saved size as it opens).
+    retried: bool,
+}
+
 /// Where a dragged tiled window was dropped.
 enum Drop {
     /// Beside this tile, on this side.
@@ -133,6 +153,7 @@ impl Wm {
             fullscreen: BTreeSet::new(),
             refused: RefCell::new(Vec::new()),
             unmovable: HashSet::new(),
+            positioned: RefCell::new(HashMap::new()),
             drag: None,
             bordered: None,
             unbordered: None,
@@ -423,10 +444,27 @@ impl Wm {
                     && self.tree.resize(id, axis, delta)
                     && let Some(ws) = self.tree.focused_workspace()
                 {
+                    self.tree.fit_weights_to_min_sizes(ws, self.config.gaps);
                     self.apply(ws);
                 }
             }
-            Command::Retile => self.apply_all(),
+            Command::ResizeToward { direction, amount } => {
+                if let Some(id) = focused
+                    && self
+                        .tree
+                        .resize_toward(id, direction, amount, self.config.gaps)
+                    && let Some(ws) = self.tree.focused_workspace()
+                {
+                    self.tree.fit_weights_to_min_sizes(ws, self.config.gaps);
+                    self.apply(ws);
+                }
+            }
+            Command::Retile => {
+                // Re-learn minimum sizes from scratch, in case an app's
+                // has shrunk or one was mistaken.
+                self.tree.clear_min_sizes();
+                self.apply_all();
+            }
             // Handled by the main loop, which owns the hotkey registrations.
             Command::ReloadConfig => {}
             Command::Quit => return ControlFlow::Break(()),
@@ -459,6 +497,7 @@ impl Wm {
             | WindowEvent::TitleChanged(id) => self.try_manage(id),
             WindowEvent::Destroyed(id) => {
                 self.unmovable.remove(&id);
+                self.positioned.borrow_mut().remove(&id);
                 self.unmanage(id);
             }
             WindowEvent::Minimized(id) if self.tree.contains_window(id) => self.minimized(id),
@@ -489,6 +528,66 @@ impl Wm {
                 self.request_live_resize();
             }
             WindowEvent::LocationChanged(_) => {}
+        }
+    }
+
+    /// Checks the tiled windows whose [`SizeCheck`] is due. One that came
+    /// out bigger than its tile is asked again; if it refuses a second time
+    /// it has a minimum size, which is recorded so the layout makes room,
+    /// taking the space from its neighbours.
+    fn check_min_sizes(&mut self, now: Instant) {
+        let due: Vec<(WindowId, SizeCheck)> = self
+            .positioned
+            .borrow()
+            .iter()
+            .filter(|(_, c)| c.due <= now)
+            .map(|(&id, &c)| (id, c))
+            .collect();
+        let mut grew = HashSet::new();
+        for (id, check) in due {
+            self.positioned.borrow_mut().remove(&id);
+            let Some(frame) = rivewm_platform::frame(id) else {
+                continue;
+            };
+            let width = if frame.width > check.tile.width + DRAG_SLACK {
+                frame.width
+            } else {
+                0
+            };
+            let height = if frame.height > check.tile.height + DRAG_SLACK {
+                frame.height
+            } else {
+                0
+            };
+            if (width, height) == (0, 0) {
+                continue;
+            }
+            if !check.retried {
+                debug!(
+                    window = format_args!("{:#x}", id.0),
+                    %frame, tile = %check.tile, "window bigger than its tile; asking again"
+                );
+                let _ = rivewm_platform::set_frame(id, check.tile);
+                self.positioned.borrow_mut().insert(
+                    id,
+                    SizeCheck {
+                        due: now + MIN_SIZE_SETTLE,
+                        retried: true,
+                        ..check
+                    },
+                );
+            } else if self.tree.raise_min_size(id, width, height) {
+                info!(
+                    window = format_args!("{:#x}", id.0),
+                    width, height, "window has a minimum size"
+                );
+                grew.extend(self.workspace_of(id));
+            }
+        }
+        for ws in grew {
+            if self.tree.is_workspace_active(ws) {
+                self.apply(ws);
+            }
         }
     }
 
@@ -705,6 +804,9 @@ impl Wm {
     /// A drag (move or resize) began on `id`. Windows runs its own loop
     /// moving the window; we just note where it started.
     fn drag_started(&mut self, id: WindowId) {
+        // Live resizing moves windows without these checks, so what we
+        // last asked of each one no longer applies.
+        self.positioned.borrow_mut().clear();
         let Some(start) = rivewm_platform::frame(id) else {
             return;
         };
@@ -797,6 +899,7 @@ impl Wm {
                 self.tree.resize_edge(id, side, grow, self.config.gaps);
             }
         }
+        self.tree.fit_weights_to_min_sizes(ws, self.config.gaps);
     }
 
     /// What's under the cursor at `(x, y)` for a drop.
@@ -912,6 +1015,7 @@ impl Wm {
         [
             self.border_reasserts.last().copied(),
             self.live_resize_at,
+            self.positioned.borrow().values().map(|c| c.due).min(),
             self.save_at,
             self.config
                 .focus_follows_mouse
@@ -929,6 +1033,9 @@ impl Wm {
         if self.live_resize_at.is_some_and(|at| at <= now) {
             self.live_resize_at = None;
             self.live_resize_step();
+        }
+        if self.drag.is_none() {
+            self.check_min_sizes(now);
         }
         if self.config.focus_follows_mouse && self.mouse_poll_at <= now {
             self.mouse_poll_at = now + MOUSE_POLL_INTERVAL;
@@ -1271,8 +1378,19 @@ impl Wm {
     }
 
     fn apply(&self, ws: NodeId) {
+        let fullscreen = self.tree.fullscreen_window(ws);
+        let now = Instant::now();
         for (id, rect) in self.tree.arrange(ws, self.config.gaps) {
             match rivewm_platform::set_frame(id, rect) {
+                Ok(()) if Some(id) != fullscreen => {
+                    // A newer tile replaces any older check, retried or not.
+                    let check = SizeCheck {
+                        tile: rect,
+                        due: now + MIN_SIZE_SETTLE,
+                        retried: false,
+                    };
+                    self.positioned.borrow_mut().insert(id, check);
+                }
                 Ok(()) => {}
                 Err(err) if rivewm_platform::is_access_denied(&err) => {
                     self.refused.borrow_mut().push(id);

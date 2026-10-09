@@ -128,7 +128,7 @@ on_top = false               # keep floating windows above tiles
 [keybindings]
 "alt+h" = "focus left"
 "alt+shift+1" = "move-to-workspace 1"
-"alt+ctrl+l" = "resize width +5"
+"alt+ctrl+l" = "resize right 5"
 # ...
 
 [[rules]]
@@ -157,9 +157,11 @@ Key bindings, IPC requests and `rivewm msg` all use the same commands:
 | `move-to-workspace <name>` | Send the focused window to a workspace |
 | `split <horizontal/vertical>`, `toggle-split` | Choose the split direction |
 | `toggle-floating`, `toggle-fullscreen` | |
+| `resize <left/right/up/down> N` | Move an edge that way by N% of the monitor |
 | `resize <width/height> <+N/-N>` | Resize by N% of the containing split |
 | `layout <dwindle/manual>` | Change the focused workspace's layout |
-| `retile`, `reload-config`, `quit` | |
+| `retile` | Re-apply the layout, re-checking apps' minimum sizes |
+| `reload-config`, `quit` | |
 
 ## Scripting and IPC
 
