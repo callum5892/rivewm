@@ -67,8 +67,7 @@ fn exec_once_already_ran() -> bool {
     false
 }
 
-/// Starts `exec`, and `exec_once` if it hasn't run since this login. Runs
-/// on its own thread so a slow-starting program can't hold up the WM.
+/// Starts `exec`, and `exec_once` if it hasn't run since this login.
 pub fn start(programs: &Programs) {
     let mut commands = programs.exec.clone();
     if !programs.exec_once.is_empty() {
@@ -78,6 +77,12 @@ pub fn start(programs: &Programs) {
             commands.extend(programs.exec_once.iter().cloned());
         }
     }
+    launch(commands);
+}
+
+/// Starts each of `commands` in turn, on a thread of their own so a slow
+/// start can't hold up the WM.
+pub fn launch(commands: Vec<String>) {
     if commands.is_empty() {
         return;
     }

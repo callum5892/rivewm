@@ -463,6 +463,7 @@ impl Wm {
                     self.apply(ws);
                 }
             }
+            Command::Exec(line) => crate::programs::launch(vec![line]),
             Command::Retile => {
                 // Re-learn minimum sizes from scratch, in case an app's
                 // has shrunk or one was mistaken.

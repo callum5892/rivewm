@@ -24,6 +24,7 @@ use crate::{Axis, Direction, Layout, WindowId};
 /// | `resize height -5`                | shrink height by 5%           |
 /// | `resize right 5`                  | move an edge right by 5% of   |
 /// |                                   | the monitor                   |
+/// | `exec wt -d C:\`                  | `Exec("wt -d C:\")`, runs it  |
 /// | `retile`, `reload-config`, `quit` | as named                      |
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -63,6 +64,9 @@ pub enum Command {
         direction: Direction,
         amount: f64,
     },
+    /// Start a program, given as the Run dialog would take it (see the
+    /// config's `[programs]`).
+    Exec(String),
     /// Re-apply the layout to every window.
     Retile,
     ReloadConfig,
@@ -122,6 +126,14 @@ impl FromStr for Command {
                 "vertical" => Axis::Vertical,
                 _ => return Err(err("expected horizontal or vertical")),
             }),
+            // Everything after `exec`, spaces and all, is the command line.
+            Some("exec") => {
+                let line = s.trim_start()["exec".len()..].trim();
+                if line.is_empty() {
+                    return Err(err("expected a program to run"));
+                }
+                Command::Exec(line.to_owned())
+            }
             Some("resize") => {
                 let a = args(2)?;
                 let percent: f64 = a[1]
@@ -213,6 +225,10 @@ mod tests {
                 amount: 0.05
             }
         );
+        assert_eq!(
+            parse(r#"exec  "C:\My Apps\x.exe"  --flag "#),
+            Command::Exec(r#""C:\My Apps\x.exe"  --flag"#.into())
+        );
         assert_eq!(parse("retile"), Command::Retile);
         assert_eq!(parse("reload-config"), Command::ReloadConfig);
         assert_eq!(parse("  quit  "), Command::Quit);
@@ -233,6 +249,8 @@ mod tests {
             "resize width",
             "resize depth +5",
             "resize width lots",
+            "exec",
+            "exec   ",
             "quit now",
             "explode",
         ] {

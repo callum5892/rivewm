@@ -82,13 +82,13 @@ menu, or Ctrl+C; every window rivewm hid is shown again on the way out.
 |---|---|
 | `Alt + H/J/K/L` or `Alt + arrows` | Focus left / down / up / right |
 | `Alt + Shift + H/J/K/L` or `Alt + Shift + arrows` | Move the focused window |
-| `Alt + Ctrl + L / H` or `Alt + Ctrl + Right / Left` | Grow / shrink width |
-| `Alt + Ctrl + J / K` or `Alt + Ctrl + Down / Up` | Grow / shrink height |
+| `Alt + Ctrl + H/J/K/L` or `Alt + Ctrl + arrows` | Resize: move the focused window's edge that way |
 | `Alt + 1..9` | Switch to workspace 1-9 |
 | `Alt + Shift + 1..9` | Send the focused window to workspace 1-9 |
 | `Alt + V` | Toggle split direction |
 | `Alt + Shift + Space` | Toggle floating |
 | `Alt + F` | Toggle fullscreen |
+| `Alt + Enter` | Open a terminal (Windows Terminal) |
 | `Alt + Shift + R` | Re-tile everything |
 | `Alt + Shift + C` | Reload the config |
 | `Alt + Shift + E` | Quit |
@@ -169,6 +169,7 @@ Key bindings, IPC requests and `rivewm msg` all use the same commands:
 | `resize <left/right/up/down> N` | Move an edge that way by N% of the monitor |
 | `resize <width/height> <+N/-N>` | Resize by N% of the containing split |
 | `layout <dwindle/manual>` | Change the focused workspace's layout |
+| `exec <program and arguments>` | Start a program, as in `[programs]` |
 | `retile` | Re-apply the layout, re-checking apps' minimum sizes |
 | `reload-config`, `quit` | |
 

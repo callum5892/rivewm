@@ -44,6 +44,7 @@ Any command from the config file's `[keybindings]` section:
 | `layout <dwindle/manual>`     | Change how new windows are placed on the focused workspace  |
 | `resize <direction> N`        | Move the focused window's edge that way by N% of the monitor |
 | `resize <width/height> <±N>`  | Grow/shrink the focused window by N% of its container       |
+| `exec <command line>`         | Start a program, as the Run dialog would                    |
 | `retile`                      | Re-apply the layout, forgetting learned minimum sizes       |
 | `reload-config`, `quit`       | As named                                                    |
 
