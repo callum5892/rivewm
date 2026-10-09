@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
-use rivewm_core::{Command, Gaps, Layout};
+use rivewm_core::{Command, Gaps, Layout, WorkspaceRule};
 use rivewm_platform::{BorderColor, Hotkey, WindowInfo};
 use serde::Deserialize;
 use tracing::info;
@@ -31,6 +31,8 @@ pub struct Config {
     pub bindings: Vec<(Hotkey, Command)>,
     pub rules: Vec<Rule>,
     pub programs: Programs,
+    /// Which monitor workspaces belong on, and which to keep when empty.
+    pub workspaces: Vec<WorkspaceRule>,
 }
 
 /// Programs to start with rivewm and stop when it quits.
@@ -146,6 +148,15 @@ struct RawConfig {
     keybindings: Option<BTreeMap<String, String>>,
     rules: Option<Vec<RawRule>>,
     programs: Option<RawPrograms>,
+    workspaces: Option<Vec<RawWorkspace>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWorkspace {
+    name: String,
+    monitor: Option<usize>,
+    persistent: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -313,6 +324,25 @@ pub fn parse(text: &str) -> Result<Config> {
         );
     }
 
+    let mut workspaces: Vec<WorkspaceRule> = Vec::new();
+    for raw in user.workspaces.or(defaults.workspaces).unwrap_or_default() {
+        let name = raw.name.trim().to_owned();
+        if name.is_empty() {
+            bail!("in [[workspaces]]: `name` can't be empty");
+        }
+        if workspaces.iter().any(|w| w.name == name) {
+            bail!("in [[workspaces]]: workspace \"{name}\" is listed twice");
+        }
+        if raw.monitor == Some(0) {
+            bail!("in [[workspaces]] \"{name}\": monitors are numbered from 1");
+        }
+        workspaces.push(WorkspaceRule {
+            name,
+            monitor: raw.monitor,
+            persistent: raw.persistent.unwrap_or(false),
+        });
+    }
+
     Ok(Config {
         gaps,
         floating_on_top,
@@ -323,6 +353,7 @@ pub fn parse(text: &str) -> Result<Config> {
         bindings,
         rules,
         programs,
+        workspaces,
     })
 }
 
@@ -460,6 +491,57 @@ mod tests {
             parse("[programs]\nstop_on_exit = [\"discord\"]").unwrap_err()
         );
         assert!(err.contains("discord.exe"), "{err}");
+    }
+
+    #[test]
+    fn workspaces_section() {
+        assert!(parse("").unwrap().workspaces.is_empty());
+        let config = parse(
+            r#"
+            [[workspaces]]
+            name = "1"
+            monitor = 2
+            persistent = true
+
+            [[workspaces]]
+            name = "web"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.workspaces,
+            [
+                WorkspaceRule {
+                    name: "1".into(),
+                    monitor: Some(2),
+                    persistent: true
+                },
+                WorkspaceRule {
+                    name: "web".into(),
+                    monitor: None,
+                    persistent: false
+                },
+            ]
+        );
+        let err = |text: &str| format!("{:#}", parse(text).unwrap_err());
+        assert!(
+            err("[[workspaces]]
+name = \"1\"
+monitor = 0")
+            .contains("from 1")
+        );
+        assert!(
+            err("[[workspaces]]
+name = \" \"")
+            .contains("empty")
+        );
+        assert!(
+            err("[[workspaces]]
+name = \"1\"
+[[workspaces]]
+name = \"1\"")
+            .contains("twice")
+        );
     }
 
     #[test]

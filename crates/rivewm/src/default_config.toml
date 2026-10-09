@@ -28,6 +28,30 @@ focused = "#33ccff"
 # Every other window rivewm manages.
 unfocused = "#595959"
 
+# Workspaces with settings of their own, one [[workspaces]] block each.
+# Workspaces not listed here are created when you switch to them, on the
+# monitor you're on, and removed once they're empty and hidden.
+#
+#   name        the workspace, as in `workspace <name>`
+#   monitor     the monitor it lives on, numbered from 1 left to right
+#               (`rivewm --list` shows the numbers). Switching to it
+#               shows it there. Optional.
+#   persistent  true to create it at startup and keep it even when empty.
+#               Optional, false by default.
+#
+# For example, 1-5 on the left monitor and 6-9 on the right, always there:
+#   [[workspaces]]
+#   name = "1"
+#   monitor = 1
+#   persistent = true
+#
+#   [[workspaces]]
+#   name = "6"
+#   monitor = 2
+#   persistent = true
+#
+# To put an app on a workspace, use a [[rules]] block with `workspace`.
+
 [programs]
 # Programs to start with rivewm, as you'd type them in the Run dialog
 # (Win+R): a full path, something on PATH, or an app name like "wt".

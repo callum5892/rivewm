@@ -70,6 +70,17 @@ impl Direction {
 #[derive(Debug, Clone)]
 pub struct SavedWeights(Vec<(NodeId, f64)>);
 
+/// Settings for one named workspace (see [`Tree::set_workspace_rules`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceRule {
+    pub name: String,
+    /// The monitor it belongs on, numbered from 1 left to right (see
+    /// [`Tree::monitor_number`]).
+    pub monitor: Option<usize>,
+    /// Exists from the start and is kept even when empty.
+    pub persistent: bool,
+}
+
 /// A monitor as the OS reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorSpec {
@@ -152,6 +163,9 @@ pub struct Tree {
     /// Layout for workspaces the tree creates itself (e.g. for a newly
     /// connected monitor).
     default_layout: Layout,
+    /// Which monitor named workspaces belong on, and which are kept even
+    /// when empty.
+    workspace_rules: Vec<WorkspaceRule>,
     /// Smallest (width, height) each window has refused to go below. Tiles
     /// are kept at least this big where the space allows.
     min_sizes: HashMap<WindowId, (i32, i32)>,
@@ -178,6 +192,7 @@ impl Tree {
             windows: HashMap::new(),
             focused_workspace: None,
             default_layout: Layout::default(),
+            workspace_rules: Vec::new(),
             min_sizes: HashMap::new(),
         }
     }
@@ -537,7 +552,9 @@ impl Tree {
         for monitor in gone {
             let name = self.monitor_name(monitor).to_owned();
             for ws in self.node(monitor).children.clone() {
-                if self.workspace_windows(ws).is_empty() {
+                if self.workspace_windows(ws).is_empty()
+                    && !self.is_persistent(self.workspace_name(ws))
+                {
                     if self.focused_workspace == Some(ws) {
                         self.focused_workspace = None;
                     }
@@ -569,6 +586,7 @@ impl Tree {
             }
         }
 
+        changed |= self.place_by_rules();
         for monitor in self.monitors().collect::<Vec<_>>() {
             self.ensure_active_workspace(monitor);
         }
@@ -622,8 +640,9 @@ impl Tree {
         self.translate_floats(ws, from_area, to_area);
     }
 
-    /// Gives a monitor an active workspace if it has none: its first one, or
-    /// a new one named with the lowest unused number.
+    /// Gives a monitor an active workspace if it has none: its first one,
+    /// or a new one. That's the first workspace bound to it that doesn't
+    /// exist yet, else the lowest unused number not bound elsewhere.
     fn ensure_active_workspace(&mut self, monitor: NodeId) {
         if self.active_workspace(monitor).is_some() {
             return;
@@ -631,10 +650,23 @@ impl Tree {
         let ws = match self.node(monitor).children.first() {
             Some(&ws) => ws,
             None => {
-                let name = (1..)
-                    .map(|n: u32| n.to_string())
-                    .find(|n| self.workspace_by_name(n).is_none())
-                    .expect("some number is free");
+                let bound_here = self
+                    .workspace_rules
+                    .iter()
+                    .find(|r| {
+                        self.workspace_by_name(&r.name).is_none()
+                            && r.monitor.and_then(|n| self.monitor_number(n)) == Some(monitor)
+                    })
+                    .map(|r| r.name.clone());
+                let name = bound_here.unwrap_or_else(|| {
+                    (1..)
+                        .map(|n: u32| n.to_string())
+                        .find(|n| {
+                            self.workspace_by_name(n).is_none()
+                                && self.bound_monitor(n).is_none_or(|m| m == monitor)
+                        })
+                        .expect("some number is free")
+                });
                 self.add_workspace(monitor, name, self.default_layout)
             }
         };
@@ -659,6 +691,82 @@ impl Tree {
                 *r = translate_into(*r, from, to);
             }
         }
+    }
+
+    /// Replaces the workspace rules. Call [`Self::apply_workspace_rules`]
+    /// to act on them.
+    pub fn set_workspace_rules(&mut self, rules: Vec<WorkspaceRule>) {
+        self.workspace_rules = rules;
+    }
+
+    /// Whether the workspace called `name` is kept even when empty.
+    pub fn is_persistent(&self, name: &str) -> bool {
+        self.workspace_rules
+            .iter()
+            .any(|r| r.persistent && r.name == name)
+    }
+
+    /// The monitor numbered `number`, counting from 1 left to right (top
+    /// to bottom where they're level), if that many are attached.
+    pub fn monitor_number(&self, number: usize) -> Option<NodeId> {
+        let mut monitors: Vec<NodeId> = self.monitors().collect();
+        monitors.sort_by_key(|&m| {
+            let bounds = self.monitor_bounds(m);
+            (bounds.x, bounds.y)
+        });
+        monitors.get(number.checked_sub(1)?).copied()
+    }
+
+    /// The attached monitor the workspace called `name` is bound to, if any.
+    pub fn bound_monitor(&self, name: &str) -> Option<NodeId> {
+        let rule = self.workspace_rules.iter().find(|r| r.name == name)?;
+        self.monitor_number(rule.monitor?)
+    }
+
+    /// Brings the workspaces in line with the rules: bound ones move (hidden)
+    /// to their monitor if it's attached, and missing persistent ones are
+    /// created. Every monitor still shows a workspace afterwards, and focus
+    /// stays on the monitor it was on. Returns whether anything changed.
+    pub fn apply_workspace_rules(&mut self) -> bool {
+        let focused_monitor = self.focused_workspace.map(|ws| self.monitor_of(ws));
+        let changed = self.place_by_rules();
+        for monitor in self.monitors().collect::<Vec<_>>() {
+            self.ensure_active_workspace(monitor);
+        }
+        let focus_ok = self
+            .focused_workspace
+            .is_some_and(|ws| self.is_workspace_active(ws));
+        if !focus_ok {
+            self.focused_workspace = focused_monitor
+                .or_else(|| self.monitors().next())
+                .and_then(|m| self.active_workspace(m));
+        }
+        changed
+    }
+
+    /// The first two steps of [`Self::apply_workspace_rules`], leaving
+    /// monitors possibly without an active workspace.
+    fn place_by_rules(&mut self) -> bool {
+        let mut changed = false;
+        for ws in self.workspaces().collect::<Vec<_>>() {
+            if let Some(monitor) = self.bound_monitor(self.workspace_name(ws))
+                && monitor != self.monitor_of(ws)
+            {
+                self.move_workspace(ws, monitor);
+                changed = true;
+            }
+        }
+        let Some(first) = self.monitors().next() else {
+            return changed;
+        };
+        for rule in self.workspace_rules.clone() {
+            if rule.persistent && self.workspace_by_name(&rule.name).is_none() {
+                let monitor = self.bound_monitor(&rule.name).unwrap_or(first);
+                self.add_workspace(monitor, rule.name, self.default_layout);
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub fn monitor_name(&self, monitor: NodeId) -> &str {
@@ -2252,6 +2360,90 @@ mod tests {
     fn names(tree: &Tree, monitor: NodeId) -> Vec<&str> {
         let children = &tree.node(monitor).children;
         children.iter().map(|&ws| tree.workspace_name(ws)).collect()
+    }
+
+    fn rule(name: &str, monitor: Option<usize>, persistent: bool) -> WorkspaceRule {
+        WorkspaceRule {
+            name: name.into(),
+            monitor,
+            persistent,
+        }
+    }
+
+    #[test]
+    fn monitors_are_numbered_left_to_right() {
+        let mut tree = Tree::new();
+        // Added right one first, as if it were the primary.
+        let right = tree.add_monitor(&right_spec());
+        let left = tree.add_monitor(&left_spec());
+        assert_eq!(tree.monitor_number(1), Some(left));
+        assert_eq!(tree.monitor_number(2), Some(right));
+        assert_eq!(tree.monitor_number(0), None);
+        assert_eq!(tree.monitor_number(3), None);
+    }
+
+    #[test]
+    fn bound_workspace_moves_to_its_monitor() {
+        let (mut tree, ws1, _) = setup_dual();
+        let (left, right) = (
+            tree.monitor_number(1).unwrap(),
+            tree.monitor_number(2).unwrap(),
+        );
+        open(&mut tree, ws1, &[1]);
+        tree.set_workspace_rules(vec![rule("1", Some(2), false)]);
+        assert!(tree.apply_workspace_rules());
+        assert_eq!(names(&tree, right), ["1", "2"]);
+        assert!(!tree.is_workspace_active(ws1), "moves hidden");
+        // The left monitor gets a fresh workspace, and keeps focus.
+        assert_eq!(names(&tree, left), ["3"]);
+        assert_eq!(tree.focused_workspace(), tree.active_workspace(left));
+        assert!(!tree.apply_workspace_rules());
+    }
+
+    #[test]
+    fn persistent_workspaces_are_created_and_survive_unplugging() {
+        let (mut tree, ..) = setup_dual();
+        tree.set_workspace_rules(vec![rule("5", Some(2), true), rule("6", None, true)]);
+        assert!(tree.apply_workspace_rules());
+        let (left, right) = (
+            tree.monitor_number(1).unwrap(),
+            tree.monitor_number(2).unwrap(),
+        );
+        assert_eq!(names(&tree, left), ["1", "6"]);
+        assert_eq!(names(&tree, right), ["2", "5"]);
+
+        // Empty "2" is dropped with its monitor; persistent "5" isn't.
+        assert!(tree.sync_monitors(&[left_spec()]));
+        let left = tree.monitors().next().unwrap();
+        assert_eq!(names(&tree, left), ["1", "5", "6"]);
+
+        // And it goes back when the monitor does.
+        assert!(tree.sync_monitors(&[left_spec(), right_spec()]));
+        let right = tree.monitor_number(2).unwrap();
+        assert_eq!(names(&tree, right), ["5"]);
+        assert!(tree.is_workspace_active(tree.workspace_by_name("5").unwrap()));
+    }
+
+    #[test]
+    fn new_monitor_shows_a_workspace_bound_to_it() {
+        let mut tree = Tree::new();
+        let left = tree.add_monitor(&left_spec());
+        tree.add_workspace(left, "1", Layout::Manual);
+        tree.set_workspace_rules(vec![rule("2", Some(1), false), rule("7", Some(2), false)]);
+        assert!(tree.sync_monitors(&[left_spec(), right_spec()]));
+        let right = tree.monitor_number(2).unwrap();
+        assert_eq!(names(&tree, right), ["7"]);
+    }
+
+    #[test]
+    fn new_monitor_skips_names_bound_elsewhere() {
+        let mut tree = Tree::new();
+        let left = tree.add_monitor(&left_spec());
+        tree.add_workspace(left, "1", Layout::Manual);
+        tree.set_workspace_rules(vec![rule("2", Some(1), false)]);
+        assert!(tree.sync_monitors(&[left_spec(), right_spec()]));
+        let right = tree.monitor_number(2).unwrap();
+        assert_eq!(names(&tree, right), ["3"]);
     }
 
     #[test]

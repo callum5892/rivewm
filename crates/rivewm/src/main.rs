@@ -435,10 +435,14 @@ fn warn_failed_hotkeys(failed: &[(Hotkey, rivewm_platform::Error)]) {
 
 fn list(all: bool) -> Result<()> {
     let monitors = rivewm_platform::monitors();
+    // Numbered left to right, as `monitor = N` in [[workspaces]] counts.
+    let mut numbered: Vec<_> = monitors.iter().collect();
+    numbered.sort_by_key(|m| (m.bounds.x, m.bounds.y));
     println!("Monitors:");
-    for m in &monitors {
+    for (n, m) in numbered.into_iter().enumerate() {
         println!(
-            "  {:#x} {}{}  bounds {}  work {}",
+            "  {} {:#x} {}{}  bounds {}  work {}",
+            n + 1,
             m.id.0,
             m.device,
             if m.primary { " (primary)" } else { "" },

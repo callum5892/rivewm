@@ -15,7 +15,7 @@ pub use geometry::Rect;
 pub use layout::Layout;
 pub use tree::{
     Axis, Direction, Gaps, MonitorSpec, NodeId, SavedFloat, SavedNode, SavedWeights,
-    SavedWorkspace, Tree,
+    SavedWorkspace, Tree, WorkspaceRule,
 };
 
 /// Opaque identifier for a native window.

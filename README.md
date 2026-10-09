@@ -126,6 +126,11 @@ live = true                  # neighbours follow a dragged edge
 [floating]
 on_top = false               # keep floating windows above tiles
 
+[[workspaces]]
+name = "1"
+monitor = 1                  # numbered left to right; see `rivewm --list`
+persistent = true            # created at startup, kept when empty
+
 [programs]
 exec = ["rivewm-bar"]        # started every time rivewm starts
 exec_once = ["wt"]           # only the first time after you log in
@@ -149,6 +154,11 @@ action = "float"
 A `[keybindings]` section replaces all the default bindings, so include
 every binding you want. `rivewm --list --all` shows each window's process
 and class, and whether rivewm manages it, which helps when writing rules.
+
+A `[[workspaces]]` block pins a workspace to a monitor (it moves there
+whenever that monitor is attached, and switching to it shows it there)
+and/or makes it persistent. To send an app to a workspace, use a
+`[[rules]]` block with `workspace`.
 
 Programs are started as the Run dialog (`Win + R`) would start them, so app
 names like `wt`, `%VARIABLES%` and arguments all work. `stop_on_exit` takes

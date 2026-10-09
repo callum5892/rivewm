@@ -137,6 +137,7 @@ impl Wm {
     pub fn new(config: Config) -> Self {
         let mut tree = Tree::new();
         tree.set_default_layout(config.default_layout);
+        tree.set_workspace_rules(config.workspaces.clone());
         // Workspaces come in `manage_existing`, from the saved layout or
         // fresh.
         for spec in monitor_specs() {
@@ -175,6 +176,13 @@ impl Wm {
             monitors = ?specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             "monitors changed"
         );
+        self.show_changes(before);
+    }
+
+    /// After workspaces have moved between monitors or been shown or hidden
+    /// in bulk: shows and hides windows to match, re-tiles, and re-focuses.
+    /// `before` is [`Self::visible_windows`] from before the change.
+    fn show_changes(&mut self, before: BTreeSet<WindowId>) {
         let after = self.visible_windows();
         // Uncloak first, so nothing flashes off and back on.
         for &id in after.difference(&before) {
@@ -213,14 +221,22 @@ impl Wm {
     pub fn set_config(&mut self, config: Config) {
         self.config = config;
         self.tree.set_default_layout(self.config.default_layout);
+        self.tree
+            .set_workspace_rules(self.config.workspaces.clone());
         let managed: Vec<_> = lock(&MANAGED).iter().copied().collect();
         for &id in &managed {
             self.sync_topmost(id);
             self.paint_border(id, self.config.border.unfocused);
         }
         self.bordered = None;
-        self.apply_all();
-        self.sync_border();
+        let before = self.visible_windows();
+        if self.tree.apply_workspace_rules() {
+            self.mark_dirty();
+            self.show_changes(before);
+        } else {
+            self.apply_all();
+            self.sync_border();
+        }
     }
 
     /// Manages every window that's already open, keeping tiled windows on
@@ -251,17 +267,16 @@ impl Wm {
                     (saved.identity(id) == Some(&identity)).then_some(info.minimized)
                 });
                 info!(restored = placed.len(), "restored saved layout");
+                // Before adopting, which hides windows on hidden workspaces.
+                self.tree.apply_workspace_rules();
                 for id in placed {
                     self.adopt(by_id[&id]);
                 }
             }
             _ => {
-                let monitors: Vec<_> = self.tree.monitors().collect();
-                for (i, monitor) in monitors.into_iter().enumerate() {
-                    let layout = self.config.default_layout;
-                    self.tree
-                        .add_workspace(monitor, (i + 1).to_string(), layout);
-                }
+                // Persistent workspaces, then one numbered workspace for
+                // each monitor still without one.
+                self.tree.apply_workspace_rules();
             }
         }
 
@@ -1102,23 +1117,32 @@ impl Wm {
         }
     }
 
-    /// Finds a workspace by name, creating it on the focused monitor if
-    /// needed (without showing it).
+    /// Finds a workspace by name, creating it if needed (without showing
+    /// it) on the monitor it's bound to, or else the focused one.
     fn workspace_named(&mut self, name: &str) -> NodeId {
         if let Some(ws) = self.tree.workspace_by_name(name) {
             return ws;
         }
-        let monitor = match self.tree.focused_workspace() {
-            Some(ws) => self.tree.monitor_of(ws),
-            None => self.tree.monitors().next().expect("no monitors"),
-        };
+        let monitor = self
+            .tree
+            .bound_monitor(name)
+            .or_else(|| {
+                self.tree
+                    .focused_workspace()
+                    .map(|ws| self.tree.monitor_of(ws))
+            })
+            .unwrap_or_else(|| self.tree.monitors().next().expect("no monitors"));
         self.tree
             .add_workspace(monitor, name, self.config.default_layout)
     }
 
-    /// Deletes a workspace once it's empty and no longer shown.
+    /// Deletes a workspace once it's empty and no longer shown, unless the
+    /// config says to keep it.
     fn remove_if_unused(&mut self, ws: NodeId) {
-        if !self.tree.is_workspace_active(ws) && self.tree.workspace_windows(ws).is_empty() {
+        if !self.tree.is_workspace_active(ws)
+            && self.tree.workspace_windows(ws).is_empty()
+            && !self.tree.is_persistent(self.tree.workspace_name(ws))
+        {
             debug!(
                 workspace = self.tree.workspace_name(ws),
                 "removing empty workspace"
